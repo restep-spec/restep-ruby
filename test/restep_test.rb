@@ -103,6 +103,32 @@ class RestepTest < Minitest::Test
     assert_empty last_response.body
   end
 
+  # 4.2: a subcollection on Active Record, scoped by parent_column.
+  def test_subcollection_on_active_record
+    get "/books/1/reviews?sort=text&limit=2"
+    assert_equal 200, last_response.status, last_response.body
+    assert_equal %w[Dense. Endless.], json["items"].map { |r| r["text"] }
+    get json["next"]
+    assert_equal %w[Vast.], json["items"].map { |r| r["text"] }
+    get "/books/1/reviews?filter[text][prefix]=E"
+    assert_equal %w[Endless.], json["items"].map { |r| r["text"] }
+    id = Review.find_by(text: "Vast.").id
+    get "/books/1/reviews/#{id}"
+    assert_equal "Vast.", json["text"]
+    get "/books/2/reviews/#{id}"
+    assert_equal 404, last_response.status
+    get "/books/999/reviews"
+    assert_equal 404, last_response.status
+    post "/books/2/reviews", JSON.generate({ "text" => "Short." }), "CONTENT_TYPE" => "application/json"
+    assert_equal 201, last_response.status, last_response.body
+    assert_match %r{\A/books/2/reviews/\d+\z}, last_response.headers["location"]
+    assert_equal 2, Review.find(json["id"].to_i).book_id
+    delete last_response.headers["location"]
+    assert_equal 204, last_response.status
+  ensure
+    Review.where(text: "Short.").delete_all
+  end
+
   def test_create_and_conditional_patch
     post "/books", JSON.generate({ "title" => "Walden", "genre" => "essay", "pages" => 352 }), "CONTENT_TYPE" => "application/json"
     assert_equal 201, last_response.status

@@ -52,8 +52,26 @@ module Restep
         raise Restep::Problem.new(404, "not_found", detail: "Nothing here. The API root lists the collections.")
       end
 
-      def restep_context(kind:, collection: nil, record: nil, action: nil)
-        Restep::Context.new(restep_request, kind: kind, collection: collection, record: record, action: action)
+      def restep_context(kind:, collection: nil, record: nil, action: nil, parents: Restep::Parents::NONE)
+        Restep::Context.new(restep_request, kind: kind, collection: collection, record: record, action: action, parents: parents)
+      end
+
+      # The resource the raw path names, resolved by the gem whatever the route looks like (a
+      # subcollection's parents included, each found under the one before): a
+      # Restep::Resolver::Target, or 404. Then 405 if the method is not allowed there.
+      #
+      #   before_action { @restep = restep_context_for(restep_target) }
+      def restep_target
+        t = Restep::Resolver.resolve(restep_request.path, method: request.method,
+                                                          idempotency_key: request.headers["Idempotency-Key"])
+        unless Restep::Resolver.allowed(t.kind, t.action, t.collection).include?(request.method)
+          raise Restep::Resolver.method_not_allowed(t.kind, restep_request.path, t.action, t.collection)
+        end
+        t
+      end
+
+      def restep_context_for(t)
+        restep_context(kind: t.kind, collection: t.collection, record: t.record, action: t.action, parents: t.parents)
       end
 
       # Writes [status, headers, body] as is: Restep sets its own validators, content types and

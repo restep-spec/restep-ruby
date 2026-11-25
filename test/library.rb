@@ -3,6 +3,7 @@
 # unless RESTEP_TEST_DATABASE names a file: a server needs a file, because each thread of a Rack
 # server gets its own connection, and each in-memory connection is a different, empty database.
 require "restep"
+require "active_record"
 
 ENV["RESTEP_CURSOR_SECRET"] ||= "restep-ruby-test-secret"
 
@@ -16,6 +17,12 @@ ActiveRecord::Schema.define do
     t.datetime :created_at, null: false, precision: 6
     t.datetime :updated_at, null: false, precision: 6
   end
+  create_table :reviews, force: true do |t|
+    t.integer :book_id, null: false
+    t.string :text, null: false
+    t.datetime :created_at, null: false, precision: 6
+    t.datetime :updated_at, null: false, precision: 6
+  end
   create_table :journals, force: true do |t|
     t.string :title, null: false
     t.boolean :active, null: false, default: true
@@ -25,6 +32,7 @@ ActiveRecord::Schema.define do
 end
 
 class Book < ActiveRecord::Base; end
+class Review < ActiveRecord::Base; end
 class Journal < ActiveRecord::Base; end
 
 module Library
@@ -48,6 +56,22 @@ module Library
       "genre" => { "type" => "enum", "values" => GENRES, "ops" => %w[eq ne in], sql: "genre" }
     },
     sort: { "title" => { sql: "title", type: "string" } }
+  )
+
+  # A subcollection on Active Record: the reviews of a book, by its book_id (4.2).
+  REVIEWS = Restep::Collection.new(
+    name: "reviews", path: "/books/{book}/reviews", parent: "books",
+    source: Restep::Sources::ActiveRecord.new("Review", parent_column: "book_id"),
+    description: "Reviews of a book.",
+    max_limit: 10,
+    fields: [
+      Restep::Fields.f(name: "id", type: "id", read_only: true),
+      Restep::Fields.f(name: "text", type: "string", required: true, max_length: 200),
+      Restep::Fields.f(name: "created_at", type: "datetime", read_only: true),
+      Restep::Fields.f(name: "updated_at", type: "datetime", read_only: true)
+    ],
+    filters: { "text" => { "type" => "string", "ops" => %w[eq prefix] } }, # the column of the field: no sql: needed
+    sort: { "text" => {} }
   )
 
   # Draft 7: a default switch (current), item actions with Content-Location, and collection
@@ -103,10 +127,12 @@ module Library
     [["Granta", true], ["Ploughshares", true], ["The Dial", false], ["Zyzzyva", true]].each do |title, active|
       Journal.create!(title: title, active: active, created_at: now, updated_at: now)
     end
+    %w[Dense. Endless. Vast.].each { |text| Review.create!(book_id: 1, text: text, created_at: now, updated_at: now) }
   end
 end
 
 Restep.configure do |c|
-  c.collections = { "books" => Library::BOOKS, "journals" => Library::JOURNALS, "papers" => Library::PAPERS }
+  c.collections = { "books" => Library::BOOKS, "reviews" => Library::REVIEWS, "journals" => Library::JOURNALS, "papers" => Library::PAPERS }
+  c.idempotency_store = Restep::Idempotency::MemoryStore.new
 end
 Library.seed

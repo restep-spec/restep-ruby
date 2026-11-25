@@ -3,9 +3,11 @@ require_relative "lib/restep/version"
 Gem::Specification.new do |s|
   s.name = "restep"
   s.version = Restep::VERSION
-  s.summary = "Restep 1 for Ruby: the protocol on Rack and Active Record"
-  s.description = "Query parsing, filters and SQL, cursors, ETags and conditional requests, idempotency, " \
-                  "discovery and errors of Restep 1, with a Rack application and a Rails concern."
+  s.summary = "Restep 1 for Ruby: the protocol on Rack, over Active Record or any data source"
+  s.description = "Query parsing, filters, cursors, ETags and conditional requests, idempotency, discovery " \
+                  "(generated or hand-written and validated), subcollections, relations and language maps of " \
+                  "Restep 1, with a Rack application and a Rails concern. Data comes from sources: Active Record " \
+                  "(optional) or lambdas for resources computed by the domain."
   s.authors = ["wubytes"]
   s.license = "MIT"
   s.homepage = "https://w3id.org/restep/tools/restep-ruby/"
@@ -17,7 +19,6 @@ Gem::Specification.new do |s|
     "rubygems_mfa_required" => "true"
   }
   s.required_ruby_version = ">= 3.4"
-  s.files = Dir["lib/**/*.rb"] + ["README.md"] + Dir["LICENSE"]
+  s.files = Dir["lib/**/*.rb"] + Dir["lib/restep/schema/*.json"] + ["README.md"] + Dir["LICENSE"]
   s.add_dependency "rack", ">= 3.0"
-  s.add_dependency "activerecord", ">= 8.0"
 end

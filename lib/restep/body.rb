@@ -3,7 +3,7 @@ module Restep
   # with the shortcuts it allows ("need not parse a body whose media type it rejects, read past
   # its size limit").
   module Body
-    MAX_BYTES = 64 * 1024
+    MAX_BYTES = 64 * 1024 # the default of Restep.config.max_body_bytes
 
     # A body with an unpaired surrogate (§3): JSON, but not an I-JSON message. Its 422 waits for
     # object!, as that of a body that is not an object does. It hashes as its own marker for the
@@ -42,7 +42,8 @@ module Restep
     # does it by passing accept_ok.
     # empty_is_object: §11.1, a POST action takes an empty body, with or without Content-Type,
     # as "{}" sent as application/json.
-    def read(request, allowed_types, accept_ok:, empty_is_object: false)
+    # max_bytes: the largest body (Restep.config.max_body_bytes, or the collection's own).
+    def read(request, allowed_types, accept_ok:, empty_is_object: false, max_bytes: MAX_BYTES)
       raw = request.raw_body
       if empty_is_object && raw.empty?
         raise not_acceptable unless accept_ok
@@ -56,9 +57,9 @@ module Restep
                           detail: "Send the body as #{allowed_types.join(" or ")} (UTF-8).",
                           headers: allowed_types.include?("application/merge-patch+json") ? { "accept-patch" => "application/merge-patch+json, application/json" } : {})
       end
-      if raw.bytesize > MAX_BYTES
+      if raw.bytesize > max_bytes
         raise not_acceptable unless accept_ok
-        raise Problem.new(413, "content_too_large", detail: "The body takes at most #{MAX_BYTES} bytes.")
+        raise Problem.new(413, "content_too_large", detail: "The body takes at most #{max_bytes} bytes.")
       end
       raise Problem.new(400, "bad_request", detail: "The request needs a JSON object as its body.") if raw.empty?
       raw = raw.dup.force_encoding(Encoding::UTF_8)

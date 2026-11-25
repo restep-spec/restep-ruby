@@ -6,7 +6,7 @@ module Restep
     MAX_QUERY_BYTES = 8 * 1024
 
     attr_reader :request, :collection, :kind, :record, :action, :query, :if_match, :if_none_match,
-                :idempotency_key, :body
+                :idempotency_key, :body, :parents, :principal
 
     # 414 outside the order of §5.4. Puma cuts off any query over 10 KB earlier, with a plain-text
     # 400 (a limit fixed at compile time); here the 414 is given as problem+json below that.
@@ -16,24 +16,37 @@ module Restep
     end
 
     # kind: :root, :collection, :item, :singleton, :item_action o :collection_action.
-    def initialize(request, kind:, collection: nil, record: nil, action: nil)
-      @request, @kind, @collection, @record, @action = request, kind, collection, record, action
+    # parents: the parent items the resolver found (Restep::Resolver::Target#parents).
+    def initialize(request, kind:, collection: nil, record: nil, action: nil, parents: Parents::NONE)
+      @request, @kind, @collection, @record, @action, @parents = request, kind, collection, record, action, parents
+      @principal = Restep.principal_for(request)
       m = request.method
-      @query = Query.new(collection, kind, request.head? ? "GET" : m, QueryString.parse(request.query_string))
+      @query = Query.new(collection, kind, request.head? ? "GET" : m, QueryString.parse(request.query_string),
+                         parents: parents, principal: @principal)
       @if_match = Conditional.parse("If-Match", request.header("If-Match"))
       @if_none_match = Conditional.parse("If-None-Match", request.header("If-None-Match"))
       # §7.1: only a POST reads the key. §11.1 (draft 7): an action declared idempotent ignores
       # keys here, so it ignores a malformed one too instead of answering 400.
       @idempotency_key = m == "POST" && !action&.idempotent ? Body.idempotency_key(request.header("Idempotency-Key")) : nil
+      refuse_anonymous_key! if @idempotency_key && @principal.nil? && Restep.config.idempotency_anonymous == false
       accept_ok = Body.accepts_json?(request.header("Accept"))
+      limit = collection&.max_body_bytes || Restep.config.max_body_bytes
       @body =
         case m
-        when "POST" then Body.read(request, %w[application/json], accept_ok: accept_ok, empty_is_object: !action.nil?)
-        when "PATCH" then Body.read(request, %w[application/merge-patch+json application/json], accept_ok: accept_ok)
+        when "POST" then Body.read(request, %w[application/json], accept_ok: accept_ok, empty_is_object: !action.nil?, max_bytes: limit)
+        when "PATCH" then Body.read(request, %w[application/merge-patch+json application/json], accept_ok: accept_ok, max_bytes: limit)
         else
           raise Body.not_acceptable if request.safe? && !accept_ok
           nil
         end
+    end
+
+    # §7.1: with "anonymous": false, a POST without credentials that carries Idempotency-Key gets
+    # 400 before any effect.
+    def refuse_anonymous_key!
+      raise Problem.new(400, "bad_request", detail: "This API takes Idempotency-Key only from authenticated requests.",
+                                            errors: [{ "header" => "Idempotency-Key", "code" => "unknown",
+                                                       "detail" => "Not accepted without credentials." }])
     end
 
     def path = request.path

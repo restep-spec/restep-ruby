@@ -1,16 +1,27 @@
 module Restep
   # A collection (or a singleton) of the application's catalog: the fields, filters and order it
-  # declares, and its representation, validation and ETag. The domain creates it with Fields.f.
+  # declares, where its data comes from (a Restep::Source), and its representation, validation
+  # and ETag. The domain creates it with Fields.f and Fields.action.
+  #
+  # A subcollection declares a path template and its parent collection (§4.2):
+  #
+  #   Restep::Collection.new(name: "drafts", parent: "policies",
+  #                          path: "/company_groups/{company_group}/policies/{policy}/drafts", ...)
+  #
+  # With a hand-written discovery document (Restep.config.discovery), what discovery declares
+  # (path, parent, description, filter, sort, max_limit...) may be left out here: the document
+  # fills it in, and Restep.check! fails on anything the code contradicts.
   class Collection
     Field = Struct.new(:name, :type, :column, :values, :nullable, :required, :default, :read_only,
-                       :max_length, :pattern, :range, :scale, :relation, :description, keyword_init: true)
+                       :max_length, :pattern, :range, :scale, :relation, :description, :include,
+                       :languages, keyword_init: true)
 
     # An action (§11.1). on: "item" or "collection"; method: "POST" or "GET" (only safe ones);
     # input: body fields (Fields.f), or nil. available: whether the item's state allows it
     # (what _actions lists); unavailable: the 409 it gives if not. run: the effect, which gets
-    # the item (or the model, in a collection action) and the validated input. In an item
-    # action, the response is the re-read item; in a collection one, run returns
-    # [status, JSON object or nil].
+    # the item (or, in a collection action, the source's scope for the parents: an Active Record
+    # relation for Restep::Sources::ActiveRecord) and the validated input. In an item action, the
+    # response is the re-read item; in a collection one, run returns [status, JSON object or nil].
     # effects: what a person may want to approve first (§11.1, draft 7), a list out of destroys,
     # external and charges, or nil to leave it undeclared. output: the JSON Schema of a safe
     # action's result, which is not a representation; a safe action without output answers its
@@ -22,27 +33,71 @@ module Restep
       def available?(rec) = available.nil? || available.call(rec)
     end
 
-    attr_reader :name, :path, :fields, :filters, :named_filters, :sort, :max_limit,
-                :default_limit, :description, :actions, :method_effects
+    attr_reader :name, :path, :template, :fields, :filters, :named_filters, :sort, :max_limit,
+                :default_limit, :description, :actions, :method_effects, :source, :parent, :count,
+                :extra_relations, :include_depth, :max_body_bytes
 
-    # conflicts: which 409 to give when the database rejects a write, by kind of error:
+    # model: an Active Record model (a class or its name), shorthand for
+    # source: Restep::Sources::ActiveRecord.new(model). source: any Restep::Source.
+    # conflicts: which 409 to give when the store rejects a write, by kind of error:
     #   { unique: ->(rec) { Problem }, foreign_key: ->(rec) { Problem } }
-    # method_effects: only for a singleton (§5.9, draft 7), the effects of its PATCH, as
-    # { "PATCH" => [...] } out of destroys, external and charges; nil leaves it undeclared, which
-    # a client counts as all three.
-    def initialize(name:, path:, model:, description:, fields:, filters: {}, named_filters: {}, sort: {},
-                   max_limit: nil, default_limit: nil, conflicts: {}, singleton: false, actions: [],
-                   method_effects: nil)
-      @name, @path, @model, @description = name, path, model, description
+    # methods and item_methods (§4.3): what the collection and its items support; by default, what
+    # the source implements. method_effects: only for a singleton (§5.9, draft 7), the effects of
+    # its PATCH, as { "PATCH" => [...] } out of destroys, external and charges; nil leaves it
+    # undeclared, which a client counts as all three.
+    # relations: relationships declared only in discovery (§9), such as the one that leads to a
+    # subcollection: { "reviews" => { "to" => "reviews", "many" => true, "path" => "/books/{book_id}/reviews" } }.
+    # A relation field (type "relation") with include: true can be expanded with include (§9).
+    def initialize(name:, fields:, path: nil, model: nil, source: nil, parent: nil, description: nil, filters: {},
+                   named_filters: {}, sort: {}, max_limit: nil, default_limit: nil, conflicts: {}, singleton: false,
+                   actions: [], method_effects: nil, methods: nil, item_methods: nil, count: "exact", relations: {},
+                   include_depth: nil, max_body_bytes: nil)
+      raise ArgumentError, "#{name}: give model: or source:, not both" if model && source
+      @name, @description, @parent = name, description, parent
       @actions = actions.to_h { |a| [a.name, a] }
       @conflicts, @singleton = conflicts, singleton
       @fields = fields.to_h { |f| [f.name, f] }
       @filters, @named_filters, @sort = filters, named_filters, sort
       @max_limit, @default_limit = max_limit, default_limit
       @method_effects = method_effects
+      @declared_methods, @declared_item_methods = methods, item_methods
+      @count = count
+      @extra_relations = relations
+      @include_depth = include_depth
+      @max_body_bytes = max_body_bytes
+      @source = source || (model && Sources::ActiveRecord.new(model)) or raise ArgumentError, "#{name}: give model: or source:"
+      @source.bind(self)
+      self.path = path if path
       check_filters!
       check_method_effects!
+      check_fields!
     end
+
+    def path=(value)
+      @template = Template.new(value)
+      @path = value
+    end
+
+    # Fills what a hand-written discovery document declares (Restep::Rules.bind!).
+    attr_writer :parent, :description, :filters, :named_filters, :sort, :max_limit, :default_limit, :count,
+                :include_depth, :declared_methods, :declared_item_methods, :method_effects, :extra_relations
+
+    def model = source.respond_to?(:model) ? source.model : raise(NoMethodError, "#{name} has no Active Record model")
+
+    # §4.3: the methods of the collection and of its items. GET goes with HEAD in Allow.
+    def methods_list
+      return @declared_methods if @declared_methods
+      singleton? ? (["GET"] + (source.supports?(:update) ? ["PATCH"] : [])) : (["GET"] + (source.supports?(:create) ? ["POST"] : []))
+    end
+
+    def item_methods_list
+      return @declared_item_methods if @declared_item_methods
+      ["GET"] + (source.supports?(:update) ? ["PATCH"] : []) + (source.supports?(:delete) ? ["DELETE"] : [])
+    end
+
+    def declared_methods? = !@declared_methods.nil?
+
+    def self.allow(methods) = methods.flat_map { |m| m == "GET" ? %w[GET HEAD] : [m] }
 
     # §4.3 and §5.9 (draft 7): a singleton may declare method_effects with PATCH as its only key.
     # This gem declares it on singletons only.
@@ -63,64 +118,157 @@ module Restep
       bad = ->(name, why) { raise ArgumentError, "#{self.name}: filter #{name}: #{why} (6.1)" }
       filters.each do |name, d|
         ops = d["ops"]
+        next if ops.nil? # filled in from a hand-written discovery document
         bad.(name, "operators come from #{OPS.join(", ")}") unless (ops - OPS).empty?
         bad.(name, "a boolean filter declares only eq, ne and null") if d["type"] == "boolean" && !(ops - %w[eq ne null]).empty?
-        bad.(name, "the id filter declares no order operators") if d[:id_like] && !(ops & %w[lt le gt ge]).empty?
-        if !(ops & %w[prefix contains]).empty? && (d["type"] != "string" || d[:id_like])
+        bad.(name, "the id filter declares no order operators") if id_filter?(name, d) && !(ops & %w[lt le gt ge]).empty?
+        if !(ops & %w[prefix contains]).empty? && (d["type"] != "string" || id_filter?(name, d))
           bad.(name, "prefix and contains only on string fields, never on an id")
         end
         bad.(name, "shares its name with a named filter") if named_filters.key?(name)
+        bad.(name, "a language map is filtered by translation, as #{name}.tag (6.1)") if fields[name]&.type == "language_map"
+        base, tag = name.split(".", 2)
+        if fields[base]&.type == "language_map"
+          bad.(name, "#{tag.inspect} is not a lowercase language tag") unless Language.tag?(tag)
+          bad.(name, "a translation is of type string") unless d["type"] == "string"
+        end
       end
       named_filters.each do |name, d|
         bad.(name, "only a switch, a named filter without type, can be a default filter") if d["default"] && d["type"]
       end
     end
 
-    # Paths relative to the API root (discovery) and absolute ones (links and headers).
-    def item_path(id) = singleton? ? path : "#{path}/#{id}"
-    def url = Restep.url(path)
-    def item_url(id) = Restep.url(item_path(id))
+    def id_filter?(name, d) = d[:id_like] || name == "id" || name.end_with?(".id")
+
+    def check_fields!
+      fields.each_value do |f|
+        if f.type == "language_map"
+          raise ArgumentError, "#{name}: #{f.name}: a singleton has no language maps in this version (5.9)" if singleton?
+          if f.languages && !f.languages.all? { |t| Language.tag?(t) }
+            raise ArgumentError, "#{name}: #{f.name}: languages must be lowercase language tags (3)"
+          end
+        end
+        raise ArgumentError, "#{name}: #{f.name}: include is for relation fields (9)" if !f.include.nil? && f.type != "relation"
+      end
+    end
+
+    # ---- Paths ----------------------------------------------------------------------------------
+
+    # The collection that holds this one's parent items (a singleton's parent may be a singleton).
+    def parent_resource
+      return nil unless parent
+      Restep.collections[parent] || Restep.singletons[parent] or raise ConfigurationError, "#{name}: parent #{parent} is not in the catalog"
+    end
+
+    # The collections whose item ids fill this path's variables, outermost first.
+    def ancestors
+      out = []
+      r = parent_resource
+      while r
+        out.unshift(r) unless r.singleton?
+        r = r.parent_resource
+      end
+      out
+    end
+
+    def ids_of(parents) = parents.is_a?(Parents) ? parents.ids : Array(parents)
+
+    # Paths relative to the API root (discovery) and absolute ones (links and headers). parents:
+    # the Parents of the request, or the parent ids in order.
+    def path_for(parents = Parents::NONE) = template.expand(ids_of(parents))
+    def item_path(id, parents = Parents::NONE) = singleton? ? path_for(parents) : "#{path_for(parents)}/#{id}"
+    def url(parents = Parents::NONE) = Restep.url(path_for(parents))
+    def item_url(id, parents = Parents::NONE) = Restep.url(item_path(id, parents))
 
     def singleton? = @singleton
 
-    def find_singleton = model.order(:id).first
+    def find_singleton(parents = Parents::NONE) = source.find_singleton(parents)
 
-    # The 409 that matches a database error on write (§5.4).
+    # The 409 that matches a store error on write (§5.4).
     def conflict(kind, rec)
       hook = @conflicts[kind]
       hook ? hook.call(rec) : Problem.new(409, "conflict", detail: "The write conflicts with the current state of #{name}.")
     end
 
-    # The model is resolved late: this file loads before the app/models autoload.
-    def model = Object.const_get(@model)
+    # §3: an id is a non-empty string of unreserved characters, never "." or "..". Anything else
+    # names no item.
+    ID = /\A[A-Za-z0-9\-._~]+\z/
 
-    def find(id_text)
-      return nil unless id_text.match?(/\A[1-9][0-9]{0,17}\z/) && Types::BIGINT.cover?(id_text.to_i)
-      model.find_by(id: id_text.to_i)
+    def self.id?(text) = text.is_a?(String) && ID.match?(text) && text != "." && text != ".."
+
+    def find(id_text, parents = Parents::NONE)
+      return nil unless Collection.id?(id_text)
+      source.find(id_text, parents)
+    end
+
+    def id_of(rec) = source.id(rec)
+
+    # ---- Relations (§9) -------------------------------------------------------------------------
+
+    def relation_fields = fields.values.select { |f| f.type == "relation" }
+
+    # The relationships discovery declares: every relation field once the API declares relations
+    # (Restep::Relations.declared?), plus those declared only in discovery.
+    def relations
+      return {} unless Relations.declared?
+      out = relation_fields.to_h do |f|
+        d = { "to" => f.relation }
+        d["include"] = true if f.include
+        d["description"] = f.description if f.description
+        [f.name, d]
+      end
+      out.merge(extra_relations)
+    end
+
+    def includable?(name) = relation_fields.any? { |f| f.name == name && f.include }
+
+    def language_map_fields = fields.values.select { |f| f.type == "language_map" }
+
+    # The relationship object of a to-one field (§3): id, and href, which a subcollection's item
+    # needs, since its path cannot be built from the id alone.
+    def relation_object(f, v)
+      return nil if v.nil?
+      target = Restep.collections.fetch(f.relation)
+      { "id" => v.to_s, "href" => target.href_for(v.to_s) }.compact
+    end
+
+    # The path of an item of this collection from its id alone; nil if a subcollection's item can
+    # no longer be found.
+    def href_for(id)
+      return item_url(id) if template.vars.empty?
+      rec = source.locate(id)
+      rec && item_url(id, source.parent_ids(rec))
     end
 
     # ---- Reading ---------------------------------------------------------------------------
 
-    def represent(rec)
-      rep = fields.values.to_h do |f|
-        v = rec[f.column]
+    def represent(rec, parents = Parents::NONE)
+      rep = field_values(rec)
+      item_actions = actions.values.select(&:item?)
+      return rep if item_actions.empty?
+      # §11.1: the actions its current state allows, so the client need not repeat the rules.
+      href = item_url(source.id(rec), parents)
+      rep.merge("_actions" => item_actions.select { |a| a.available?(rec) }.to_h { |a|
+        [a.name, { "method" => a.method, "href" => "#{href}:#{a.name}" }]
+      })
+    end
+
+    # The fields of the representation, without the _ members.
+    def field_values(rec)
+      fields.values.to_h do |f|
+        v = source.value(rec, f.column)
         out =
           case f.type
           when "id" then v.to_s
-          when "relation" then v.nil? ? nil : { "id" => v.to_s, "href" => Restep.collections.fetch(f.relation).item_url(v) }
-          when "decimal" then Types.render_decimal(v, f.scale)
+          when "relation" then relation_object(f, v)
+          when "decimal" then Types.render_decimal(v.is_a?(String) ? BigDecimal(v) : v, f.scale)
           when "datetime" then Types.render_datetime(v)
-          when "date" then v&.iso8601
+          when "date" then v.is_a?(String) ? v : v&.iso8601
+          when "language_map" then Language.render(v)
           else v
           end
         [f.name, out]
       end
-      item_actions = actions.values.select(&:item?)
-      return rep if item_actions.empty?
-      # §11.1: the actions its current state allows, so the client need not repeat the rules.
-      rep.merge("_actions" => item_actions.select { |a| a.available?(rec) }.to_h { |a|
-        [a.name, { "method" => a.method, "href" => "#{item_url(rec.id)}:#{a.name}" }]
-      })
     end
 
     # Validates an action's body against its input. Returns { name => value } or raises 422.
@@ -183,8 +331,13 @@ module Restep
         if !body.key?(f.name)
           if f.required then errors << err(ptr, "required", "#{f.name} is required.")
           elsif !f.default.nil? then attrs[f.column] = f.default
+          elsif f.type == "language_map" then attrs[f.column] = {}
           else attrs[f.column] = nil
           end
+        elsif f.type == "language_map"
+          # §3: in a POST, a language map is an object of strings; null is not one.
+          val = Language.validate(f, body[f.name], ptr, errors, patch: false)
+          attrs[f.column] = val unless val == :error
         elsif body[f.name].nil?
           if f.nullable then attrs[f.column] = nil
           else errors << err(ptr, "required", "#{f.name} cannot be null.")
@@ -202,7 +355,7 @@ module Restep
     def changes_for_patch(rec, body)
       errors = []
       changes = {}
-      current = represent(rec)
+      current = field_values(rec)
       body.each do |k, v|
         next if k.start_with?("_")
         f = fields[k]
@@ -215,20 +368,24 @@ module Restep
           errors << err(ptr, "format", leap_second_detail(f))
         elsif f.read_only
           errors << err(ptr, "read_only", "#{k} cannot be changed.") unless same_read_only?(f, v, current[k])
-        elsif f.type == "relation" && v.is_a?(Hash) && current[k].is_a?(Hash) && v["id"] == current[k]["id"]
+        elsif f.type == "language_map"
+          # §3: merged by key, validated first (deleted keys too); left as it was, it changes nothing.
+          merged = Language.merge(f, current[k] || {}, v, ptr, errors)
+          changes[f.column] = merged unless merged == :error || merged == (current[k] || {})
+        elsif f.type == "relation" && current_relation?(f, v, current[k])
           # Relation with its current value: ignored without checking that the target exists
           # (§5.1); only href, if present, is checked to be that item's path.
           check_href(f, v, ptr, errors)
         elsif v.nil?
           if f.nullable
-            changes[f.column] = nil unless rec[f.column].nil?
+            changes[f.column] = nil unless source.value(rec, f.column).nil?
           else
             errors << err(ptr, "required", "#{k} cannot be null.")
           end
         else
           val = coerce(f, v, ptr, errors)
           next if val == :error
-          changes[f.column] = val unless same_value?(rec[f.column], val)
+          changes[f.column] = val unless same_value?(source.value(rec, f.column), val)
         end
       end
       raise Problem.invalid(errors) unless errors.empty?
@@ -253,16 +410,25 @@ module Restep
     def esc(k) = k.gsub("~", "~0").gsub("/", "~1")
 
     # §5.1: an href that is not the path of an item of the target collection, or whose last
-    # segment is not the id sent, gives 422 (see the journal, B6-4: the text is worded for
-    # subcollections).
+    # segment is not the id sent, gives 422 format. Returns false on that error, or the item's
+    # parent ids when the href is a subcollection item's path.
     def check_href(f, v, ptr, errors)
-      return true unless v.key?("href")
       target = Restep.collections.fetch(f.relation)
+      return [] unless v.key?("href")
       href = v["href"]
       decoded = href.is_a?(String) ? (QueryString.decode(href) rescue nil) : nil
-      return true if decoded && v["id"].is_a?(String) && decoded == target.item_url(v["id"])
-      errors << err("#{ptr}/href", "format", "#{f.name}.href must be the path of the item, #{target.url}/{id}, with the id sent.")
+      ids = decoded && v["id"].is_a?(String) && Resolver.item_path_ids(target, decoded, v["id"])
+      return ids if ids
+      errors << err("#{ptr}/href", "format", "#{f.name}.href must be the path of the item, #{Restep.url(target.path)}/{id}, with the id sent.")
       false
+    end
+
+    # §5.1: a relationship object leaves the field as it was when it names the same item: the same
+    # id and, for a subcollection's item (whose id is unique only under its parent), the same href.
+    def current_relation?(f, v, cur)
+      return false unless v.is_a?(Hash) && cur.is_a?(Hash) && v["id"] == cur["id"]
+      return true if !v.key?("href") || Restep.collections.fetch(f.relation).template.vars.empty?
+      v["href"].is_a?(String) && (QueryString.decode(v["href"]) rescue nil) == cur["href"]
     end
 
     def leap_second_detail(f) = "#{f.name} has a leap second (:60), which this API does not accept; use :59 or the next minute."
@@ -336,13 +502,20 @@ module Restep
           errors << err("#{ptr}/id", "type", "#{f.name}.id must be a string.")
           return :error
         end
-        return :error unless check_href(f, v, ptr, errors)
-        target = Restep.collections.fetch(f.relation).find(id)
-        unless target
+        target = Restep.collections.fetch(f.relation)
+        # §5.1: to link an item of a subcollection the client sends its href, as read.
+        if !target.template.vars.empty? && !v.key?("href")
+          errors << err("#{ptr}/href", "required", "#{f.name}.href is required: #{f.relation} is a subcollection, so its items are linked by their path.")
+          return :error
+        end
+        ids = check_href(f, v, ptr, errors)
+        return :error unless ids
+        rec = Resolver.find_under(target, id, ids)
+        unless rec
           errors << err("#{ptr}/id", "unknown", "There is no #{f.relation} item with id #{id.inspect}.")
           return :error
         end
-        target.id
+        target.source.id(rec)
       end
     end
   end

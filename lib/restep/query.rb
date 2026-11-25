@@ -1,35 +1,53 @@
 module Restep
-  # Reserved parameters (§5.3) and the query profile (§6): parsing, errors in order, and SQL.
+  # Reserved parameters (§5.3), the query profile (§6) and include (§9): parsing and errors in
+  # order. What is left (filters, named filters, sort, limit, count and the position the cursor
+  # carries) goes to the collection's source, which runs it.
   class Query
     RESERVED = %w[filter sort fields include count limit cursor since languages].freeze
     MAX_IN = 500
-    SQL_OPS = { "eq" => "=", "ne" => "<>", "lt" => "<", "le" => "<=", "gt" => ">", "ge" => ">=" }.freeze
+    DEFAULT_LIMIT = 20
 
     Filter = Struct.new(:field, :op, :value, :raw, :name, keyword_init: true)
     Named = Struct.new(:name, :value, :raw, keyword_init: true)
 
-    attr_reader :collection, :filters, :named, :sort, :fields, :limit, :count, :cursor_payload, :pairs
+    attr_reader :collection, :filters, :named, :sort, :fields, :limit, :count, :cursor_payload, :pairs,
+                :includes, :parents, :principal
 
-    # kind: :root, :collection or :item; method: the request's.
-    def initialize(collection, kind, method, pairs)
+    # kind: :root, :collection, :item, :singleton, :item_action or :collection_action; method:
+    # the request's. parents: those of the request (the cursor is bound to them); principal: who
+    # the request acts for (and the cursor too, §6.4).
+    def initialize(collection, kind, method, pairs, parents: Parents::NONE, principal: nil)
       @collection, @kind, @method, @pairs = collection, kind, method, pairs
-      @filters, @named, @sort, @fields = [], [], [], nil
+      @parents, @principal = parents, principal
+      @filters, @named, @sort, @fields, @includes = [], [], [], nil, []
       @switched_off = [] # default switches the request turns off with filter[name]=false (§6.1)
-      @limit = collection&.default_limit
+      # §5.2: the server picks the page size when the request does not.
+      @limit = collection && (collection.default_limit || [collection.max_limit, DEFAULT_LIMIT].compact.min)
       @count = false
       @issues = [] # [category (0 unsupported, 1 invalid), position, name, detail]
       analyze
     end
 
+    # The position the source returned for the previous page (§6.4), or nil on the first one.
+    def position = @cursor_payload && @cursor_payload["k"]
+
     def supported
       safe = %w[GET HEAD].include?(@method)
       return [] unless safe
       case @kind
-      when :collection then %w[filter sort fields limit cursor count]
-      when :item, :singleton then %w[fields]
+      when :collection
+        list = %w[filter sort fields cursor]
+        list << "limit" if collection.max_limit
+        list << "count" if collection.count
+        list << "include" if include_offered?
+        list
+      when :item then include_offered? ? %w[fields include] : %w[fields]
+      when :singleton then %w[fields]
       else []
       end
     end
+
+    def include_offered? = Relations.declared? && collection.relation_fields.any?(&:include)
 
     def unsupported(i, name, detail) = @issues << [0, i, name, detail]
     def invalid(i, name, detail) = @issues << [1, i, name, detail]
@@ -38,6 +56,7 @@ module Restep
       sup = supported
       seen = {}
       raw_cursor = nil
+      raw_fields = nil
       @pairs.each_with_index do |p, i|
         name = p.name
         base = name[/\A[^\[]*/]
@@ -68,7 +87,8 @@ module Restep
         seen[base] = true
         case base
         when "sort" then analyze_sort(p, i)
-        when "fields" then analyze_fields(p, i)
+        when "fields" then raw_fields = [p, i]
+        when "include" then analyze_include(p, i)
         when "limit" then analyze_limit(p, i)
         when "count" then analyze_count(p, i)
         when "cursor"
@@ -77,6 +97,8 @@ module Restep
           end
         end
       end
+      # fields after include: a dotted path is valid only with its relationship included (§9).
+      analyze_fields(*raw_fields) if raw_fields
       apply_defaults_and_required if list?
       raise_first!
       check_cursor(*raw_cursor) if raw_cursor
@@ -107,10 +129,10 @@ module Restep
     def unsupported_detail(base)
       case @kind
       when :root then "The API root takes no reserved parameters."
-      when :item, :singleton then @method == "GET" || @method == "HEAD" ? "Here only fields is supported." : "#{@method} takes no reserved parameters."
+      when :item, :singleton then @method == "GET" || @method == "HEAD" ? "Here only #{supported.join(" and ")} #{supported.size > 1 ? "are" : "is"} supported." : "#{@method} takes no reserved parameters."
       else
         if %w[GET HEAD].include?(@method)
-          "#{base} is not supported here; this collection supports filter, sort, fields, limit, cursor and count."
+          "#{base} is not supported here; this collection supports #{supported.join(", ")}."
         else
           "#{@method} takes no reserved parameters."
         end
@@ -243,7 +265,7 @@ module Restep
       end
     end
 
-    # ---- sort, fields, limit, count ---------------------------------------------------------
+    # ---- sort, fields, include, limit, count ------------------------------------------------
 
     def analyze_sort(p, i)
       return invalid(i, p.name, "sort cannot be empty.") if p.value.nil? || p.value.empty?
@@ -261,13 +283,58 @@ module Restep
       @sort = keys
     end
 
+    # §6.3 and §9: names of fields, or dotted paths into an included relationship
+    # (author.name). A path into a language map (name.es) is a field that does not exist.
     def analyze_fields(p, i)
       return invalid(i, p.name, "fields cannot be empty.") if p.value.nil? || p.value.empty?
       list = p.value.split(",", -1)
       return invalid(i, p.name, "fields has an empty name.") if list.any?(&:empty?)
-      unknown = list.reject { |f| collection.fields.key?(f) }
-      return invalid(i, p.name, "Unknown field#{"s" if unknown.size > 1}: #{unknown.join(", ")}. Fields: #{collection.fields.keys.join(", ")}.") unless unknown.empty?
+      list.each do |f|
+        problem = field_path_problem(f)
+        return invalid(i, p.name, problem) if problem
+      end
       @fields = list
+    end
+
+    def field_path_problem(path)
+      segs = path.split(".", -1)
+      coll = collection
+      segs.each_with_index do |seg, n|
+        f = coll.fields[seg]
+        return "Unknown field #{path}. Fields: #{coll.fields.keys.join(", ")}." if f.nil?
+        return nil if n == segs.size - 1
+        return "#{path}: #{seg} is a language map, which fields takes whole." if f.type == "language_map"
+        return "Unknown field #{path}: #{seg} is not a relationship." unless f.type == "relation" && Relations.declared?
+        prefix = segs[0..n].join(".")
+        return "#{path} needs include=#{prefix}: a dotted path in fields goes into an included relationship." unless @includes.include?(prefix)
+        coll = Restep.collections.fetch(f.relation)
+      end
+      nil
+    end
+
+    # §9: include=author,author.publisher: declared, expandable relationships, up to the
+    # collection's include_depth (1 if not declared).
+    def analyze_include(p, i)
+      return invalid(i, p.name, "include cannot be empty.") if p.value.nil? || p.value.empty?
+      list = p.value.split(",", -1)
+      return invalid(i, p.name, "include has an empty name.") if list.any?(&:empty?)
+      depth = collection.include_depth || 1
+      list.each do |path|
+        segs = path.split(".", -1)
+        return unsupported(i, p.name, "include goes at most #{depth} relationship#{"s" if depth > 1} deep here (include_depth).") if segs.size > depth
+        coll = collection
+        segs.each do |seg|
+          unless coll.includable?(seg)
+            names = coll.relation_fields.select(&:include).map(&:name)
+            return unsupported(i, p.name, "#{seg} is not a relationship that #{coll.name} can include#{names.empty? ? "" : "; it can include: #{names.join(", ")}"}.")
+          end
+          coll = Restep.collections.fetch(coll.fields[seg].relation)
+        end
+        return invalid(i, p.name, "#{path} appears twice in include.") if @includes.include?(path)
+        @includes << path
+      end
+      # A dotted path includes the relationships it goes through.
+      @includes = @includes.flat_map { |x| s = x.split("."); (1..s.size).map { |n| s.first(n).join(".") } }.uniq
     end
 
     def analyze_limit(p, i)
@@ -285,10 +352,12 @@ module Restep
 
     # ---- cursor -------------------------------------------------------------------------------
 
+    # §6.4: a cursor is bound to the collection (with its parents' ids: the same subcollection
+    # under another parent is another collection), the filters, the sort and the principal.
     def binding_payload
       f = @filters.map { |x| ["f", x.field, x.op, x.raw] } + @named.map { |x| ["n", x.name, x.raw] }
-      { "c" => collection.name, "f" => Digest::SHA256.hexdigest(JSON.generate(f.sort))[0, 22],
-        "s" => @sort.map { |k, d| d ? "-#{k}" : k }.join(","), "p" => PRINCIPAL }
+      { "c" => collection.name, "a" => parents.ids, "f" => Digest::SHA256.hexdigest(JSON.generate(f.sort))[0, 22],
+        "s" => @sort.map { |k, d| d ? "-#{k}" : k }.join(","), "p" => Restep.principal_key(principal) }
     end
 
     def check_cursor(token, i)
@@ -303,156 +372,8 @@ module Restep
       end
     end
 
-    # ---- SQL ----------------------------------------------------------------------------------
-
-    def where_clauses
-      clauses = @filters.map { |f| filter_sql(collection.filters[f.field], f.op, f.value) }
-      clauses += @named.map { |n| sanitize(collection.named_filters[n.name][:sql].call(n.value)) }
-      clauses
-    end
-
-    def sanitize(arr) = ActiveRecord::Base.sanitize_sql_array(arr)
-
-    def q(v) = ActiveRecord::Base.connection.quote(v)
-
-    def literal(type, v)
-      case type
-      when "integer" then Types::BIGINT.cover?(v) ? "#{v}::bigint" : "#{q(v.to_s)}::numeric"
-      when "decimal" then "#{q(v.to_s("F"))}::numeric"
-      when "date" then "#{q(v.iso8601)}::date"
-      when "boolean" then v ? "TRUE" : "FALSE"
-      else q(v)
-      end
-    end
-
-    def filter_sql(decl, op, value)
-      col = decl[:sql]
-      return value ? "#{col} IS NULL" : "#{col} IS NOT NULL" if op == "null"
-      return id_filter_sql(col, op, value) if decl[:id_like]
-      return datetime_filter_sql(col, op, value) if decl["type"] == "datetime"
-      return text_match_sql(col, op, value) if %w[prefix contains].include?(op)
-      if op == "in"
-        "#{col} IN (#{value.map { |v| literal(decl["type"], v) }.join(", ")})"
-      elsif op == "nin"
-        # §6.1: nin, like every operator but null, never matches an absent or null value.
-        "#{col} IS NOT NULL AND #{col} NOT IN (#{value.map { |v| literal(decl["type"], v) }.join(", ")})"
-      else
-        "#{col} #{SQL_OPS.fetch(op)} #{literal(decl["type"], value)}"
-      end
-    end
-
-    # §6.1 (draft 7): prefix and contains by code points, which is what the declared collation
-    # says for these columns (COLLATE "C" on PostgreSQL; SQLite compares bytes).
-    def text_match_sql(col, op, value)
-      lit = q(value)
-      postgres = ActiveRecord::Base.connection.adapter_name.match?(/postg/i)
-      if op == "prefix"
-        postgres ? "starts_with(#{col}, #{lit})" : "substr(#{col}, 1, length(#{lit})) = #{lit}"
-      else
-        postgres ? "strpos(#{col}, #{lit}) > 0" : "instr(#{col}, #{lit}) > 0"
-      end
-    end
-
-    # The id is a string (§3): only the canonical strings of a bigint can match.
-    def id_filter_sql(col, op, value)
-      canon = ->(s) { s.match?(/\A[1-9][0-9]{0,17}\z/) ? s.to_i : nil }
-      case op
-      when "eq" then (n = canon.(value)) ? "#{col} = #{n}" : "FALSE"
-      when "ne" then (n = canon.(value)) ? "#{col} <> #{n}" : "#{col} IS NOT NULL"
-      when "in"
-        ns = value.filter_map { |v| canon.(v) }
-        ns.empty? ? "FALSE" : "#{col} IN (#{ns.join(", ")})"
-      when "nin"
-        ns = value.filter_map { |v| canon.(v) }
-        ns.empty? ? "#{col} IS NOT NULL" : "#{col} NOT IN (#{ns.join(", ")})"
-      end
-    end
-
-    # Exact comparison of instants even if the value has more precision than the microseconds
-    # PostgreSQL stores (which would round): see the journal.
-    def datetime_filter_sql(col, op, r)
-      if %w[in nin].include?(op)
-        exact = r.select { |x| Types.micro_exact?(x) }
-        return op == "in" ? "FALSE" : "#{col} IS NOT NULL" if exact.empty?
-        list = exact.map { |x| "#{q(Types.sql_instant(x))}::timestamptz" }.join(", ")
-        return op == "in" ? "#{col} IN (#{list})" : "#{col} IS NOT NULL AND #{col} NOT IN (#{list})"
-      end
-      lit = ->(mode) { "#{q(Types.sql_instant(r, mode))}::timestamptz" }
-      if Types.micro_exact?(r)
-        "#{col} #{SQL_OPS.fetch(op)} #{lit.(:floor)}"
-      else
-        case op
-        when "eq" then "FALSE"
-        when "ne" then "#{col} IS NOT NULL"
-        when "lt", "le" then "#{col} <= #{lit.(:floor)}"
-        when "gt", "ge" then "#{col} >= #{lit.(:ceil)}"
-        end
-      end
-    end
-
-    def order_sql
-      parts = @sort.map { |k, desc| "#{collection.sort[k][:sql]} #{desc ? "DESC" : "ASC"} NULLS LAST" }
-      (parts + ["id ASC"]).join(", ")
-    end
-
-    # "After the last row" condition with nulls last in both directions. SQL's row comparison,
-    # (a, id) > (x, y), does not work with nulls.
-    def keyset_sql(keys, last_id)
-      ors = []
-      eqs = []
-      @sort.each_with_index do |(k, desc), idx|
-        d = collection.sort[k]
-        v = keys[idx]
-        lit = v.nil? ? nil : sort_literal(d[:type], v)
-        unless v.nil?
-          ors << (eqs + ["(#{d[:sql]} #{desc ? "<" : ">"} #{lit} OR #{d[:sql]} IS NULL)"]).join(" AND ")
-        end
-        eqs << (v.nil? ? "#{d[:sql]} IS NULL" : "#{d[:sql]} = #{lit}")
-      end
-      ors << (eqs + ["id > #{Integer(last_id)}"]).join(" AND ")
-      "(" + ors.map { |o| "(#{o})" }.join(" OR ") + ")"
-    end
-
-    def sort_literal(type, v)
-      case type
-      when "datetime" then "#{q(v)}::timestamptz"
-      when "decimal" then "#{q(v)}::numeric"
-      when "date" then "#{q(v)}::date"
-      when "integer" then "#{Integer(v)}::bigint"
-      else q(v)
-      end
-    end
-
-    def sort_value(rec, key)
-      d = collection.sort[key]
-      v = rec[d[:sql]]
-      case v
-      when nil then nil
-      when Time, ActiveSupport::TimeWithZone then v.utc.strftime("%Y-%m-%dT%H:%M:%S.%6NZ")
-      when BigDecimal then v.to_s("F")
-      when Date then v.iso8601
-      else v
-      end
-    end
-
-    # Runs the query and returns [records, next cursor or nil, total or nil].
-    def run
-      model = collection.model
-      scope = model.all
-      where_clauses.each { |c| scope = scope.where(Arel.sql(c)) }
-      total = @count ? scope.count : nil
-      if @cursor_payload
-        scope = scope.where(Arel.sql(keyset_sql(@cursor_payload["k"], @cursor_payload["i"])))
-      end
-      rows = scope.order(Arel.sql(order_sql)).limit(@limit + 1).to_a
-      next_token = nil
-      if rows.size > @limit
-        rows = rows.first(@limit)
-        last = rows.last
-        next_token = Cursor.issue(binding_payload.merge("k" => @sort.map { |k, _| sort_value(last, k) }, "i" => last.id))
-      end
-      [rows, next_token, total]
-    end
+    # The cursor of the next page, from the position the source returned.
+    def issue_cursor(position) = Cursor.issue(binding_payload.merge("k" => position))
 
     # §6.4: next carries the cursor and leaves the other parameters as they arrived.
     def next_link(path, token)
@@ -460,10 +381,20 @@ module Restep
       "#{path}?#{(kept + ["cursor=#{QueryString.encode_component(token)}"]).join("&")}"
     end
 
-    def project(rep)
-      return rep unless @fields
-      rep.select { |k, _| k == "id" || k.start_with?("_") || @fields.include?(k) }
+    # §6.3 and §9: only the fields asked for, plus id and the _ members; a dotted path projects the
+    # included item it goes into.
+    def project(rep, paths = @fields, nested: false)
+      return rep unless paths
+      top = paths.map { |p| p.split(".", 2) }
+      rep.each_with_object({}) do |(k, v), out|
+        # In an included item, href stays too: a relationship object to a subcollection needs it (§3).
+        next out[k] = v if k == "id" || k.start_with?("_") || (nested && %w[href type].include?(k))
+        sub = top.select { |a, _| a == k }
+        next if sub.empty?
+        out[k] = if sub.any? { |_, rest| rest.nil? } || !v.is_a?(Hash) then v
+                 else project(v, sub.map(&:last), nested: true)
+                 end
+      end
     end
   end
-
 end

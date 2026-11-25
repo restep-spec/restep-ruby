@@ -6,23 +6,32 @@ module Restep
   module Cursor
     module_function
 
+    MIN_SECRET_BYTES = 16
+
+    # The secret every replica shares: Restep.config.cursor_secret (in Rails, the railtie derives
+    # one from secret_key_base with the application's key_generator) or RESTEP_CURSOR_SECRET. It
+    # is never generated here: one per process would make each replica reject the others'
+    # cursors. Without one, Restep.check! fails at boot.
     def secret
-      @secret ||= ENV["RESTEP_CURSOR_SECRET"] || begin
-        path = Restep.config.cursor_key_path or raise "Restep.config.cursor_key_path is not set"
-        File.write(path, SecureRandom.hex(32)) unless File.exist?(path)
-        File.read(path).strip
+      s = Restep.config.cursor_secret || ENV["RESTEP_CURSOR_SECRET"]
+      if s.nil? || s.to_s.empty?
+        raise ConfigurationError, "Restep.config.cursor_secret is not set (nor RESTEP_CURSOR_SECRET): every replica must share " \
+                                  "it, so it is never generated. In Rails, require \"restep/rails\" to derive it from secret_key_base."
       end
+      raise ConfigurationError, "the cursor secret must have at least #{MIN_SECRET_BYTES} bytes" if s.to_s.bytesize < MIN_SECRET_BYTES
+      s.to_s
     end
 
     # Deterministic encryption: the nonce comes from an HMAC of the content (SIV style). With a
     # random nonce, every response would carry a different next and the page would change body
     # and ETag on every read, so If-None-Match would never give 304 on a collection (see the
-    # journal, B6-6).
+    # journal, B6-6). The keys are derived again when the secret changes.
     def keys
-      @keys ||= begin
-        material = OpenSSL::KDF.pbkdf2_hmac(secret, salt: "restep-cursor", iterations: 1000, length: 64, hash: "SHA256")
-        [material[0, 32], material[32, 32]]
-      end
+      s = secret
+      return @keys if @keys && @keys_for == s
+      material = OpenSSL::KDF.pbkdf2_hmac(s, salt: "restep-cursor", iterations: 1000, length: 64, hash: "SHA256")
+      @keys_for = s
+      @keys = [material[0, 32], material[32, 32]]
     end
 
     def issue(payload)

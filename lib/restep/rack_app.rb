@@ -1,12 +1,17 @@
 module Restep
   # Restep server as a Rack application with a single entry point: it resolves the resource
-  # itself and applies the error order of §5.4 from start to finish. It is mounted behind
-  # Restep::Envelope (501, profile and CORS):
+  # itself (subcollections included) and applies the error order of §5.4 from start to finish.
+  # It is mounted behind Restep::Envelope (501, profile and CORS):
   #
   #   use Restep::Envelope
   #   run Restep::RackApp.new
+  #
+  # Creating it runs Restep.check!, so a misconfiguration fails at boot.
   class RackApp
-    def initialize(logger: nil) = @logger = logger
+    def initialize(logger: nil, check: true)
+      @logger = logger
+      Restep.check! if check
+    end
 
     def call(env)
       request = Request.new(env)
@@ -24,16 +29,15 @@ module Restep
     def handle(request)
       path = request.path
       Context.check_uri_length!(request) unless [Restep.url("/status"), Restep.url("/docs")].include?(path)
-      kind, coll, rec, action = Resolver.resolve(path, method: request.method,     # 1. 404
-                                                       idempotency_key: request.header("Idempotency-Key"))
-      unless Resolver.allowed(kind, action).include?(request.method)              # 2. 405
-        raise Resolver.method_not_allowed(kind, path, action)
+      t = Resolver.resolve(path, method: request.method, idempotency_key: request.header("Idempotency-Key")) # 1. 404
+      unless Resolver.allowed(t.kind, t.action, t.collection).include?(request.method)                      # 2. 405
+        raise Resolver.method_not_allowed(t.kind, path, t.action, t.collection)
       end
-      return Operations.status if kind == :status
-      return Operations.docs if kind == :docs
+      return Operations.status if t.kind == :status
+      return Operations.docs if t.kind == :docs
 
-      ctx = Context.new(request, kind: kind, collection: coll, record: rec, action: action) # 3 and 4
-      case [kind, request.method]
+      ctx = Context.new(request, kind: t.kind, collection: t.collection, record: t.record, action: t.action, parents: t.parents) # 3 and 4
+      case [t.kind, request.method]
       in [:item_action | :collection_action, _] then Operations.action(ctx)
       in [:root, _] then Operations.discovery(ctx)
       in [:collection, "GET" | "HEAD"] then Operations.list(ctx)
