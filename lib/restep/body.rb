@@ -40,58 +40,74 @@ module Restep
     # Returns the body's JSON value (an object or not: see object!) or raises 415, 413 or 400, in
     # that order. Before the 413, the 406 has to be checked, as it comes first in §5.4: the caller
     # does it by passing accept_ok.
+    # request: anything with raw_body and content_type (a Restep::Request, or an object of the
+    # application's own).
     # empty_is_object: §11.1, a POST action takes an empty body, with or without Content-Type,
     # as "{}" sent as application/json.
     # max_bytes: the largest body (Restep.config.max_body_bytes, or the collection's own).
-    def read(request, allowed_types, accept_ok:, empty_is_object: false, max_bytes: MAX_BYTES)
+    # decimal_class: what a number with a fraction or an exponent becomes (see parse).
+    def read(request, allowed_types, accept_ok:, empty_is_object: false, max_bytes: MAX_BYTES, decimal_class: BigDecimal)
       raw = request.raw_body
       if empty_is_object && raw.empty?
         raise not_acceptable unless accept_ok
         return {}
       end
-      mt = media_type(request.content_type)
       # §3 (draft 6): an empty body is also a body; without Content-Type it gives 415, and empty
-      # with application/json, 400 (JSON.parse rejects it further down).
-      if mt.nil? || !allowed_types.include?(mt[0]) || (mt[1] && mt[1] != "utf-8")
-        raise Problem.new(415, "unsupported_media_type",
-                          detail: "Send the body as #{allowed_types.join(" or ")} (UTF-8).",
-                          headers: allowed_types.include?("application/merge-patch+json") ? { "accept-patch" => "application/merge-patch+json, application/json" } : {})
-      end
+      # with application/json, 400 (parse rejects it).
+      media_type!(request.content_type, allowed_types)
       if raw.bytesize > max_bytes
         raise not_acceptable unless accept_ok
         raise Problem.new(413, "content_too_large", detail: "The body takes at most #{max_bytes} bytes.")
       end
-      raise Problem.new(400, "bad_request", detail: "The request needs a JSON object as its body.") if raw.empty?
-      raw = raw.dup.force_encoding(Encoding::UTF_8)
-      raise Problem.new(400, "bad_request", detail: "The body is not valid UTF-8.") unless raw.valid_encoding?
-      # §3 (draft 7): a body is an I-JSON message. Duplicate member names give 400 bad_request,
-      # because the meaning would depend on the parser; an unpaired surrogate, which the parser
-      # refuses, gives the 422 invalid with a format entry that §3 allows.
-      doc = begin
-        JSON.parse(raw, decimal_class: BigDecimal, allow_nan: false, allow_duplicate_key: false)
-      rescue JSON::ParserError => e
-        unpaired = nil
-        message = e.message.lines.first.to_s.strip
-        if message.include?("duplicate key")
-          raise Problem.new(400, "bad_request", detail: "The body repeats a member name in an object: #{message[0, 120]}")
-        end
-        # Deferred like a body that is not an object: object! raises it after the preconditions
-        # (§5.4: no 422 from the content while 412 applies).
-        if message.include?("surrogate")
-          # §3 and §5.4 (draft 7): a body that also has a JSON syntax error (or a duplicate member
-          # name) gets 400 bad_request. The parser stops at the first surrogate, so the rest is
-          # checked again with the unpaired ones replaced.
-          syntax_error!(raw)
-          unpaired = Unpaired.new(Problem.invalid([{ "pointer" => "", "code" => "format", "detail" => "The body has an unpaired surrogate." }],
-                                            detail: "The body is not an I-JSON message: it has an unpaired surrogate."))
-        end
-        unpaired or raise Problem.new(400, "bad_request", detail: "The body is not valid JSON: #{message[0, 120]}")
-      end
+      doc = parse(raw, decimal_class: decimal_class)
       # §5.1 and §4.3: a JSON value that is not an object is kept as is; it gives 422 through
       # object!, which the operation calls after the preconditions (§5.4: the 412 comes before the
       # content's 422).
       raise not_acceptable unless accept_ok
       doc
+    end
+
+    # §3: the media type of a body, or 415 unsupported_media_type. Only allowed_types, with no
+    # charset or charset=utf-8. Returns [type, charset].
+    def media_type!(content_type, allowed_types)
+      mt = media_type(content_type)
+      return mt unless mt.nil? || !allowed_types.include?(mt[0]) || (mt[1] && mt[1] != "utf-8")
+      raise Problem.new(415, "unsupported_media_type",
+                        detail: "Send the body as #{allowed_types.join(" or ")} (UTF-8).",
+                        headers: allowed_types.include?("application/merge-patch+json") ? { "accept-patch" => "application/merge-patch+json, application/json" } : {})
+    end
+
+    # §3: parses a raw body (a String of bytes) as an I-JSON message, with no media type or size
+    # check (media_type! and read do those). Returns its JSON value, which may not be an object
+    # (object! decides), or an Unpaired for a body with an unpaired surrogate, whose 422 object!
+    # raises. Raises 400 bad_request for an empty body, one that is not UTF-8 or not JSON, or one
+    # that repeats a member name.
+    # decimal_class: BigDecimal (the default) keeps every number with a fraction or an exponent
+    # exact, as §2 compares numbers ("equal as JSON values"); nil gives Float, as JSON.parse does.
+    # Integers are always Integer.
+    def parse(raw, decimal_class: BigDecimal)
+      raise Problem.new(400, "bad_request", detail: "The request needs a JSON object as its body.") if raw.nil? || raw.empty?
+      raw = raw.dup.force_encoding(Encoding::UTF_8)
+      raise Problem.new(400, "bad_request", detail: "The body is not valid UTF-8.") unless raw.valid_encoding?
+      options = { allow_nan: false, allow_duplicate_key: false }
+      options[:decimal_class] = decimal_class if decimal_class
+      # §3 (draft 7): a body is an I-JSON message. Duplicate member names give 400 bad_request,
+      # because the meaning would depend on the parser; an unpaired surrogate, which the parser
+      # refuses, gives the 422 invalid with a format entry that §3 allows.
+      JSON.parse(raw, **options)
+    rescue JSON::ParserError => e
+      message = e.message.lines.first.to_s.strip
+      if message.include?("duplicate key")
+        raise Problem.new(400, "bad_request", detail: "The body repeats a member name in an object: #{message[0, 120]}")
+      end
+      raise Problem.new(400, "bad_request", detail: "The body is not valid JSON: #{message[0, 120]}") unless message.include?("surrogate")
+      # Deferred like a body that is not an object: object! raises it after the preconditions
+      # (§5.4: no 422 from the content while 412 applies). §3 and §5.4 (draft 7): a body that also
+      # has a JSON syntax error (or a duplicate member name) gets 400 bad_request. The parser stops
+      # at the first surrogate, so the rest is checked again with the unpaired ones replaced.
+      syntax_error!(raw)
+      Unpaired.new(Problem.invalid([{ "pointer" => "", "code" => "format", "detail" => "The body has an unpaired surrogate." }],
+                                   detail: "The body is not an I-JSON message: it has an unpaired surrogate."))
     end
 
     # A \u escape of a surrogate pair, of a lone surrogate, or any other escape (so that "\\ud800",

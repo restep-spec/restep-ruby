@@ -39,7 +39,9 @@ module Workspace
        ["Defrost", 1, nil, nil, "0.5"], ["Bake bread", 3, "ada", "2026-12-02", nil]].each do |title, prio, author, due, score|
         create_note({ "title" => title, "body" => nil, "priority" => prio, "author_id" => author,
                       "due_on" => due && Date.iso8601(due), "score" => score && BigDecimal(score), "pinned" => false,
-                      "summary" => { "Buy flour" => { "en" => "Flour", "es-es" => "Harina" }, "Bake bread" => { "es-es" => "Pan" } }.fetch(title, {}) },
+                      "summary" => { "Buy flour" => { "en" => "Flour", "es-es" => "Harina" }, "Bake bread" => { "es-es" => "Pan" } }.fetch(title, {}),
+                      "tags" => title == "Buy flour" ? %w[shop] : [],
+                      "meta" => title == "Buy flour" ? { "store" => { "name" => "Corner shop", "open" => true }, "qty" => 1.5 } : nil },
                     kitchen["id"])
       end
       first = @notes.values.first
@@ -144,6 +146,13 @@ module Workspace
       F.f(name: "author", type: "relation", column: "author_id", relation: "people", nullable: true, include: true,
           description: "Who wrote it."),
       F.f(name: "summary", type: "language_map", languages: %w[en es-es]),
+      # Documents the note carries: any JSON array or object, described by its schema (4.3) and
+      # checked by validate:. A PATCH merges meta member by member (RFC 7396) and replaces tags.
+      F.f(name: "tags", type: "array", default: [], schema: { "items" => { "type" => "string" }, "maxItems" => 10 },
+          validate: ->(v, ptr) { v.each_with_index.reject { |t, _| t.is_a?(String) }.map { |_, i| { "pointer" => "#{ptr}/#{i}", "code" => "type", "detail" => "A tag is a string." } } },
+          description: "Free labels."),
+      F.f(name: "meta", type: "object", nullable: true, schema: { "properties" => { "qty" => { "type" => "number" } } },
+          description: "Whatever else the note needs to keep."),
       F.f(name: "created_at", type: "datetime", read_only: true),
       F.f(name: "updated_at", type: "datetime", read_only: true)
     ],
@@ -167,6 +176,20 @@ module Workspace
     actions: [
       F.action("pin", on: "item", effects: [], description: "Pin the note.", available: ->(r) { !r["pinned"] },
                       run: ->(r, _) { Workspace.store.update(r, "pinned" => true) }),
+      # A safe action with POST (11.1): a result computed from its input, which is not the note.
+      F.action("compare", on: "item", safe: true, idempotent: true, description: "Which fields differ from the ones sent.",
+                          input: [F.f(name: "with", type: "object", required: true)],
+                          output: { "type" => "object", "properties" => { "differs" => { "type" => "array", "items" => { "type" => "string" } } } },
+                          run: ->(r, input) { [200, { "differs" => input["with"].keys.select { |k| r[k] != input["with"][k] }.sort }] }),
+      # An unsafe item action that creates another item: 201 with its Location (11.1).
+      F.action("copy", on: "item", effects: [], description: "Copy the note into the same shelf.",
+                       run: lambda { |r, _|
+                         copy = Workspace.store.create_note(r.slice("title", "body", "priority", "due_on", "score", "author_id", "summary", "tags", "meta").merge("pinned" => false), r["shelf_id"])
+                         Restep::Created.new(NOTES.item_url(copy["id"], [r["shelf_id"]]))
+                       }),
+      # An unsafe item action that answers nothing (204).
+      F.action("touch", on: "item", idempotent: true, effects: [], description: "Mark the note as seen now.",
+                        run: ->(r, _) { Workspace.store.update(r, {}) && Restep::NO_CONTENT }),
       F.action("stats", on: "collection", method: "GET", safe: true, idempotent: true, description: "How many notes the shelf has.",
                         output: { "type" => "object", "properties" => { "count" => { "type" => "integer" } } },
                         run: ->(parents, _) { [200, { "count" => Workspace.store.notes.values.count { |n| n["shelf_id"] == parents["shelf"] } }] })

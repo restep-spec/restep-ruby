@@ -167,7 +167,8 @@ require "restep/rails"   # the concern, restep_action routes and the railtie
 
 config.middleware.delete Rack::ETag               # Restep sets its own validators
 config.middleware.delete Rack::ConditionalGet
-config.middleware.insert_before 0, Restep::Envelope, cors: false, credentials: true   # a same-origin, cookie API
+config.middleware.insert_before 0, Restep::Envelope, cors: false, credentials: true,  # a same-origin, cookie API
+                                  path: "/v1"   # only the API: the app's HTML pages keep their params
 config.exceptions_app = Restep::Rails::Controller.exceptions_app
 
 # app/controllers/drafts_controller.rb: any route shape, nested or not
@@ -228,8 +229,9 @@ served as written, and every request is answered by what it declares.
 | Principal (§2) | `c.principal = ->(request) { ... }` returns who the request acts for, a string, or `nil` for the anonymous principal. Idempotency keys and cursors belong to it, and reads become `Cache-Control: private` (§5.1). `c.idempotency_anonymous = false` refuses `Idempotency-Key` without one (§7.1) |
 | Cursor secret (§6.4) | `c.cursor_secret` (or `RESTEP_CURSOR_SECRET`; in Rails, derived from `secret_key_base`). Never generated: one per process would break cursors across replicas, so `Restep.check!` fails without it |
 | Body limit | `c.max_body_bytes`, or `max_body_bytes:` on one collection |
-| CORS (§5.8) | `use Restep::Envelope` (`cors: "*"`, the default), `cors: false` for a same-origin API, or `cors: ["https://editor.example"]` to name origins, with `Vary: Origin`. With `credentials: true` (cookies), unsafe requests a browser sends from any other origin get 403, as §5.8 requires; allowed origins also get `Access-Control-Allow-Credentials` |
-| Idempotency store (§7.1) | `c.idempotency_model = "IdempotencyKey"` (PostgreSQL table, see `Restep::Idempotency::ActiveRecordStore`), or `c.idempotency_store = Restep::Idempotency::MemoryStore.new` for one process |
+| CORS (§5.8) | `use Restep::Envelope` (`cors: "*"`, the default), `cors: false` for a same-origin API, or `cors: ["https://editor.example"]` to name origins, with `Vary: Origin`. With `credentials: true` (cookies), unsafe requests a browser sends from any other origin get 403, as §5.8 requires; allowed origins also get `Access-Control-Allow-Credentials`. `exempt: ->(env) { ... }` names the requests the application authenticates only with a token a browser never attaches on its own, which §5.8 does not cover: `exempt: Restep::Envelope.method(:token_authorization?)` takes any `Authorization` scheme but Basic, Digest, Negotiate and NTLM |
+| Where the API is | `path: "/v1"` (or a list) on `Restep::Envelope`: only requests under it get the envelope (501, profile link, CORS, the origin check, and Rails' parameter parsing turned off); the rest of the application is left untouched |
+| Idempotency store (§7.1) | `c.idempotency_model = "IdempotencyKey"` (PostgreSQL table, see `Restep::Idempotency::ActiveRecordStore`), or `c.idempotency_store = Restep::Idempotency::MemoryStore.new` for one process. `Restep::Idempotency::ActiveRecordStore.new("IdempotencyKey", unique_by: ..., purge_every: 3600)`: the unique index on `(principal, http_method, path, key)` is found by its columns (or pass its name), and every expired key is deleted once per `purge_every` seconds (`nil`: never; call `store.purge` from a job) |
 
 ## Relations and language maps
 
@@ -257,6 +259,30 @@ well-formed and lowercase, `type`, `unknown` for a language the field does not t
 in a `PATCH` (`null` deletes a translation, `{"title": null}` empties it), declared in
 `language_maps`, and filtered or sorted by translation (`"title.es-es" => { "type" => "string", ... }`).
 
+## Documents: object and array fields
+
+A field may hold any JSON object or array that the item carries (§3, §4.3): its shape goes in the
+`schemas` of discovery, never in the types of §4.2, which are for filters.
+
+```ruby
+Restep::Fields.f(name: "layout", type: "object", nullable: true,
+                 schema: { "properties" => { "columns" => { "type" => "integer" } } },   # merged into {"type": "object"}
+                 validate: ->(value, pointer) { value["columns"].is_a?(Integer) ? nil : [{ "pointer" => "#{pointer}/columns", "code" => "type", "detail" => "An integer." }] })
+Restep::Fields.f(name: "tags", type: "array", default: [], schema: { "items" => { "type" => "string" } })
+```
+
+- A body's value is checked as an I-JSON message: a string (or a member name) with U+0000 or a
+  noncharacter gives `422` with a `format` entry at that string (at `""` for a member name), and a
+  number a double cannot hold without losing digits gives `range`; it is never rounded. Numbers
+  with a fraction are stored as `Float`, integers stay exact.
+- In a `PATCH`, an object merges member by member (RFC 7396: `null` deletes a member) and is then
+  validated whole; an array is replaced. A value equal as JSON to the current one changes nothing.
+- `validate:` runs on the value after its type (and, in a `PATCH`, after merging) and returns the
+  `422` entries, or `nil`. It works on any field.
+- The update schema gives an object field only its type, since a merge patch may leave any member
+  out or set it to `null`. A filter or sort key never names the whole field: declare a dotted path to
+  a member (`layout.columns`) with its own `sql:` or `value:` (§6.1).
+
 ## API
 
 ### `Restep::Collection.new`
@@ -266,7 +292,7 @@ in a `PATCH` (`null` deletes a translation, `{"title": null}` empties it), decla
 | `name`, `path`, `description` | Name in discovery, path relative to the API root (a URI template for a subcollection), description |
 | `parent` | For a subcollection, or a singleton under an item: the collection (or singleton) it hangs from |
 | `model` or `source` | An Active Record model (or its name), or any `Restep::Source` |
-| `fields` | `Restep::Fields.f(name:, type:, ...)`: `column`, `values`, `nullable`, `required`, `default`, `read_only` (a field only the server sets, other than `id`: a POST ignores it whatever its value, a PATCH accepts only its current value, §5.1), `max_length`, `pattern`, `range`, `scale`, `relation`, `include`, `languages`, `description`. Types: `id`, `string`, `enum`, `integer`, `decimal` (with `scale`), `boolean`, `date`, `datetime`, `relation`, `language_map` |
+| `fields` | `Restep::Fields.f(name:, type:, ...)`: `column`, `values`, `nullable`, `required`, `default`, `read_only` (a field only the server sets, other than `id`: a POST ignores it whatever its value, a PATCH accepts only its current value, §5.1), `max_length`, `pattern`, `range`, `scale`, `relation`, `include`, `languages`, `schema` (object and array fields), `validate`, `description`. Types: `id`, `string`, `enum`, `integer`, `decimal` (with `scale`), `boolean`, `date`, `datetime`, `relation`, `language_map`, `object`, `array` |
 | `filters` | `{ "field" => { "type", "ops" } }` plus how to run it: `sql:` (Active Record), `value:` (computed); `"required" => true` for a filter every list request must carry (§6.1). Operators: `eq`, `ne`, `lt`, `le`, `gt`, `ge`, `in`, `nin`, `null`, and `prefix` and `contains` on strings (by code points) |
 | `named_filters` | `{ "name" => { "description", sql: ->(value) { ["SQL ?", value] } } }`, or `match: ->(record, value) { ... }` on a computed source (§6.1); a switch (no `"type"`) may declare `"default" => true`, and any named filter `"required" => true` |
 | `sort` | `{ "field" => { sql: "column", type: "string" } }` (`{}` takes the field's column and type) |
@@ -284,12 +310,31 @@ in a `PATCH` (`null` deletes a translation, `{"title": null}` empties it), decla
 `GET`, a safe one is also idempotent, `new` is reserved for the safe `GET` collection action that
 gives the starting values of a new item, `changes` is reserved, and `effects` takes `destroys`,
 `external` and `charges` (a safe action, only `charges`). `output` is the schema of a safe action's
-result. At run time:
+result. At run time, what each kind answers is what §11.1 allows, and anything else is a 500, as a
+programming error:
 
-- an item action's `run` changes the item, and the gem answers 200 with the item, its new `ETag` and
-  `Content-Location`, or, with `Prefer: return=minimal`, 204 without `ETag`;
-- a collection action's `run` returns `[status, body]`: an unsafe one answers 201 or 204, a safe one
-  200 only with a declared `output` (anything else is a 500, as a programming error);
+- an unsafe item action's `run` changes the item, and the gem answers 200 with the item, its new
+  `ETag` and `Content-Location`, or, with `Prefer: return=minimal`, 204 without `ETag`. If `run`
+  returns `Restep::Created.new(location)` (or `Restep::Created.new(location, body)`), the answer is
+  201 with that `Location`, such as a new version; if it returns `Restep::NO_CONTENT`, 204;
+- an unsafe collection action's `run` returns `Restep::Created.new(location)` (201 with `Location`)
+  or `[204, nil]`: a collection has no representation of its own, so never 200, and a 201 always
+  carries the `Location` of what it created;
+- a safe action's `run` returns `[status, result]`: 200 with the result (on a collection, only with a
+  declared `output`), or `[204, nil]`; never 201. With `GET` it is a read, with `ETag` and 304. A safe
+  action may use `POST` to take an `input` in its body: that is the way to compute something from
+  data the client sends (a diff, a quote), whose 200 is `no-store`, after `If-Match` against the item
+  (412) and before the input's 422;
+
+```ruby
+Restep::Fields.action("diff", on: "item", safe: true, idempotent: true,          # POST /drafts/7:diff
+                      input: [Restep::Fields.f(name: "with", type: "object", required: true)],
+                      output: { "type" => "object" },
+                      run: ->(draft, input) { [200, draft.diff(input["with"])] })
+Restep::Fields.action("publish", on: "item", effects: [],                         # POST /drafts/7:publish
+                      run: ->(draft, _) { Restep::Created.new(Restep.url("/versions/#{draft.publish!.id}")) })
+```
+
 - an action declared `idempotent: true` ignores `Idempotency-Key`, a malformed one too;
 - a `GET` action takes no `params`, so it answers any query parameter with `400
   unsupported_parameter` (§5.3, §11.1);
@@ -319,6 +364,11 @@ gives `invalid_parameter` too, with the limit in `detail`.
 | `Restep::Problem` | A Restep error; `raise Restep::Problem.new(409, "conflict", reason: "...", detail: "...")`. The codes are the closed table of §5.4 (`Restep::Problem::CODES`); a status it does not list takes `http_` and its digits, and a code that does not go with its status raises `ArgumentError`. Every problem is `no-store` |
 | `Restep::Rules`, `Restep::Discovery` | The rules of draft 7 for a discovery document, its JSON Schema, and the document itself |
 | `Restep::Query`, `Restep::Cursor`, `Restep::Conditional`, `Restep::Idempotency`, `Restep::Parents` | Query parsing, encrypted cursor, preconditions, idempotency, the parents of a request |
+| `Restep::Body` | `parse(raw, decimal_class: BigDecimal)` parses a raw body as an I-JSON message (400, or an `Unpaired` whose 422 `object!` raises), with no `Restep::Request`; `media_type!(content_type, types)` gives the 415; `read(request, types, accept_ok:, decimal_class:)` does both for anything with `raw_body` and `content_type`; `object!` gives the 422 of a body that is not an object. `decimal_class: nil` gives `Float` |
+| `Restep::Conditional` | `parse(name, value)` gives `:any`, a list of entity tags or 400; an empty header is an empty list (RFC 9110 §5.6.1), which no ETag matches. `evaluate(if_match, if_none_match, etag, safe:)` gives `nil`, `:not_modified` or 412 |
+| `Restep::QueryString` | `parse(query_string)` keeps repeated names and brackets as received; a `%` that starts no escape gives 400 (RFC 3986 §2.1). `well_formed?`, `decode` |
+| `Restep::MergePatch` | `apply(target, patch)`: JSON Merge Patch (RFC 7396) |
+| `Restep::Created`, `Restep::NO_CONTENT` | What an action's `run` returns for a 201 with `Location`, or a 204 |
 
 ## Namespace
 

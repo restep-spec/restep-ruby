@@ -130,6 +130,55 @@ module Restep
       s << "Z"
     end
 
+    # §3: a JSON value of a field of type object or array, as a request body carries it, checked
+    # as an I-JSON message and made ready to store and render. Strings (member names too) must be
+    # valid UTF-8 without U+0000 or noncharacters; a number with a fraction or an exponent becomes
+    # a Float, and one a double cannot hold without losing digits (I-JSON, RFC 7493 section 2.2)
+    # is refused rather than rounded. Integers stay exact. Each fault is a 422 entry: at the
+    # string that holds it, or at "" for a member name (§3: a pointer to it would carry it too).
+    # Returns the value, or :error with the entries added to errors.
+    def json_value(v, pointer, errors)
+      before = errors.size
+      out = normalize_json(v, pointer, errors)
+      errors.size == before ? out : :error
+    end
+
+    def normalize_json(v, pointer, errors)
+      case v
+      when Hash
+        v.to_h do |k, x|
+          k = k.to_s
+          unless storable_string?(k)
+            errors << { "pointer" => "", "code" => "format", "detail" => "A member name has a character that cannot be stored (NUL or a noncharacter)." }
+            next [k, nil]
+          end
+          [k, normalize_json(x, "#{pointer}/#{k.gsub("~", "~0").gsub("/", "~1")}", errors)]
+        end
+      when Array then v.each_with_index.map { |x, i| normalize_json(x, "#{pointer}/#{i}", errors) }
+      when String
+        unless storable_string?(v)
+          errors << { "pointer" => pointer, "code" => "format", "detail" => "The string has a character that cannot be stored (NUL, an unpaired surrogate or a noncharacter)." }
+        end
+        v
+      when BigDecimal, Float then json_float(v, pointer, errors)
+      when Integer, true, false, nil then v
+      else
+        errors << { "pointer" => pointer, "code" => "type", "detail" => "Not a JSON value." }
+        nil
+      end
+    end
+
+    def storable_string?(s) = s.valid_encoding? && !s.include?("\u0000") && !noncharacter?(s)
+
+    def json_float(v, pointer, errors)
+      f = v.to_f
+      exact = f.finite? && (v.is_a?(Float) || BigDecimal(f.to_s) == v)
+      return f if exact
+      errors << { "pointer" => pointer, "code" => "range",
+                  "detail" => "The number has more digits or magnitude than a double holds (I-JSON); send it as a string." }
+      nil
+    end
+
     # Canonical form to compare bodies "equal as JSON values" (§7.1): sorted keys and normalized
     # exact numbers (1, 1.0 and 1e0 are the same number).
     def canonical_json(v)

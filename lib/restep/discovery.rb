@@ -130,6 +130,10 @@ module Restep
           required = target && !target.template.vars.empty? ? %w[id href] : ["id"]
           { "type" => "object", "required" => required,
             "properties" => { "id" => { "type" => "string" }, "href" => { "type" => "string" } } }
+        # §4.3: the shape of a document goes in the schemas. In an update schema an object is a
+        # merge patch (RFC 7396), where any member may be null or left out, so only its type is given.
+        when "object" then mode == :update ? { "type" => "object" } : { "type" => "object" }.merge(f.schema || {})
+        when "array" then { "type" => "array" }.merge(f.schema || {})
         when "language_map"
           # §3 and §4.3: an object of strings by lowercase tag; an update schema accepts null for
           # the field and for any well-formed key.
@@ -139,7 +143,7 @@ module Restep
             { "type" => "object", "propertyNames" => LANGUAGE_KEY, "additionalProperties" => { "type" => "string" } }
           end
         end
-      s = { "type" => [s["type"], "null"] }.merge(s.except("type")) if f.nullable && f.type != "language_map"
+      s = { "type" => [s["type"], "null"] }.merge(s.except("type")) if f.nullable && f.type != "language_map" && s["type"].is_a?(String)
       s["description"] = f.description if f.description
       s["default"] = f.default if mode == :create && !f.default.nil?
       s["readOnly"] = true if f.read_only && mode == :item

@@ -126,7 +126,7 @@ module Restep
     # the item's ETag, §7.2), 422 on the input, and then the effect.
     def action(ctx)
       a = ctx.action
-      return safe_action(ctx, a) if a.method == "GET"
+      return safe_action(ctx, a) if a.safe
       return collection_action(ctx, a) unless a.item?
       coll = ctx.collection
       precheck = lambda do
@@ -148,10 +148,17 @@ module Restep
           Conditional.evaluate(ctx.if_match, ctx.if_none_match, coll.etag(coll.represent(rec, ctx.parents)), safe: false)
           input = coll.validate_input(a, Body.object!(ctx.body))
           before = coll.represent(rec, ctx.parents)
-          a.run.call(rec, input)
-          rec = coll.source.reload(rec, ctx.parents) or raise gone
-          after = coll.represent(rec, ctx.parents)
-          write_result(ctx, 200, rec, after, invalidate: after != before, action: true)
+          result = a.run.call(rec, input)
+          reloaded = coll.source.reload(rec, ctx.parents)
+          after = reloaded && coll.represent(reloaded, ctx.parents)
+          if result.is_a?(Created) || result.is_a?(NoContent)
+            # §11.1: a new resource (201 with Location) or nothing (204); neither carries an ETag
+            # (7.2), and the item, if the action changed or deleted it, is invalidated.
+            groups = [coll.url(ctx.parents)] + (after == before ? [] : [coll.item_url(target_id(coll, rec), ctx.parents)])
+            next created_or_empty(result, groups)
+          end
+          raise gone unless reloaded
+          write_result(ctx, 200, reloaded, after, invalidate: after != before, action: true)
         end
       end
       # §11.1: an idempotent action may ignore Idempotency-Key, because repeating it is already safe.
@@ -169,6 +176,10 @@ module Restep
     # _etag, nil if it no longer exists, :unknown if the response names no item.
     def stored_item_current(coll, parents, target_id = nil)
       lambda do |body, headers|
+        # The 201 of an action may name a resource of another collection (a new version): that
+        # one is not this collection's item.
+        location = headers["location"]
+        next :unknown if location && !location.start_with?("#{coll.url(parents)}/")
         id = (JSON.parse(body)["id"] rescue nil) if body
         id ||= headers["location"]&.split("/")&.last
         id ||= target_id if body.nil?
@@ -185,15 +196,38 @@ module Restep
       ctx.query.pairs.group_by(&:name).sort_by(&:first).map { |name, pairs| [name, pairs.map(&:value)] }
     end
 
-    # A safe action with GET: no effects, with ETag and 304 like any read.
-    # §11.1 (draft 7): its 200 is the result that output declares; without output, a collection's
-    # safe action answers 204, never 200.
+    # A safe action: no effects. §11.1 (draft 7): its 200 is the result that output declares;
+    # without output, a collection's safe action answers 204, never 200, and a safe action never
+    # answers 201. With GET it is a read, with ETag and 304; with POST it takes an input and is
+    # answered with no-store, after the preconditions (412, against the item ETag on an item,
+    # 7.2) and before the 422 of its input (5.4).
     def safe_action(ctx, a)
       coll = ctx.collection
-      target = a.item? ? ctx.record : coll.source.scope(ctx.parents)
-      status, doc = a.run.call(target, {})
+      if a.item?
+        raise gone if ctx.record.is_a?(Resolver::Missing)
+        target = ctx.record
+      else
+        target = coll.source.scope(ctx.parents)
+      end
+      input = {}
+      if a.method == "POST"
+        if a.item?
+          if ctx.if_match || ctx.if_none_match
+            Conditional.evaluate(ctx.if_match, ctx.if_none_match, coll.etag(coll.represent(target, ctx.parents)), safe: false)
+          end
+        else
+          precheck_collection(ctx).call
+        end
+        input = coll.validate_input(a, Body.object!(ctx.body))
+      end
+      status, doc = a.run.call(target, input)
       if !doc.nil? && a.output.nil? && !a.item?
         raise ArgumentError, "the safe action #{a.name} on a collection answers 200 only with a declared output (11.1)"
+      end
+      raise ArgumentError, "the safe action #{a.name} creates nothing, so it never answers 201 (11.1)" if status == 201
+      if a.method == "POST"
+        return [204, { "cache-control" => "no-store" }, nil] if doc.nil?
+        return [200, { "content-type" => "application/json", "cache-control" => "no-store" }, JSON.generate(doc)]
       end
       return [status, { "cache-control" => read_cache_control }, nil] if doc.nil?
       read_response(ctx, JSON.generate(doc), groups: [coll.url(ctx.parents)])
@@ -204,16 +238,32 @@ module Restep
       coll.source.transaction do
         precheck_collection(ctx).call
         input = coll.validate_input(a, Body.object!(ctx.body))
-        status, doc = a.run.call(coll.source.scope(ctx.parents), input)
+        result = a.run.call(coll.source.scope(ctx.parents), input)
         # §11.1 (draft 7): an unsafe action on a collection has no representation of its own, so
         # it answers 201 with the Location of what it creates, or 204; never 200.
-        unless [201, 204].include?(status)
+        next created_or_empty(result, [coll.url(ctx.parents)]) if result.is_a?(Created)
+        status, doc = result
+        if status == 201
+          raise ArgumentError, "the action #{a.name} answers 201 without Location: return Restep::Created.new(location) (11.1)"
+        end
+        unless status == 204 && doc.nil?
           raise ArgumentError, "the unsafe action #{a.name} on a collection answers 201 or 204, not #{status} (11.1)"
         end
-        headers = { "cache-control" => "no-store", "cache-group-invalidation" => sf_list([coll.url(ctx.parents)]) }
-        next [status, headers, nil] if doc.nil?
-        [status, headers.merge("content-type" => "application/json"), JSON.generate(doc)]
+        created_or_empty(NO_CONTENT, [coll.url(ctx.parents)])
       end
+    end
+
+    # The 201 (with Location and, if run gave one, a body) or the 204 of an unsafe action.
+    def created_or_empty(result, groups)
+      headers = { "cache-control" => "no-store", "cache-group-invalidation" => sf_list(groups) }
+      return [204, headers, nil] if result.is_a?(NoContent)
+      unless result.location.is_a?(String) && result.location.start_with?("/", "https:", "http:")
+        raise ArgumentError, "Restep::Created needs the Location of what the action created, an absolute path or URI (3, 11.1)"
+      end
+      headers["location"] = result.location
+      return [201, headers, nil] if result.body.nil?
+      raise ArgumentError, "the body of Restep::Created is a JSON object" unless result.body.is_a?(Hash)
+      [201, headers.merge("content-type" => "application/json"), JSON.generate(result.body)]
     end
 
     # ---- Support -----------------------------------------------------------------------------

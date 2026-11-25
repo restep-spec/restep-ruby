@@ -79,8 +79,8 @@ module Restep
       def run(scope, request_hash, ttl:, precheck:, replay:)
         k = scope.values_at(:principal, :http_method, :path, :key)
         entry = @lock.synchronize do
-          e = @entries[k]
-          @entries.delete(k) if e && e.expires_at < Time.now
+          now = Time.now
+          @entries.delete_if { |_, e| e.expires_at < now }
           @entries[k] ||= Entry.new(request_hash: request_hash, completed: false, expires_at: Time.now + ttl, status: :new)
         end
         if entry.request_hash != request_hash
@@ -111,7 +111,15 @@ module Restep
 
     # Keys in a table, with PostgreSQL, valid with several processes. The table needs principal,
     # http_method, path, key, request_hash, completed, status, headers (json), body, expires_at,
-    # and a unique index named index_idempotency_keys_unique on (principal, http_method, path, key).
+    # and a unique index on (principal, http_method, path, key), whatever its name:
+    #
+    #   c.idempotency_store = Restep::Idempotency::ActiveRecordStore.new("IdempotencyKey")
+    #   c.idempotency_store = Restep::Idempotency::ActiveRecordStore.new("IdempotencyKey", purge_every: 300)
+    #
+    # unique_by: the unique index, as its columns (the default) or its name, as insert_all takes it.
+    # purge_every: seconds between two purges of every expired key, run by whichever request comes
+    # first after that time (nil: never; then call purge from a job). A request always deletes the
+    # expired row of its own key first, so an expired key is never replayed.
     #
     # 1. The key's record (with the request hash) is inserted and committed right away, outside
     #    the effect's transaction, so another request with the same key sees it.
@@ -123,18 +131,43 @@ module Restep
     #    the effect exactly once.
     # 4. A rejected request (4xx) deletes the row: it does not spend the key.
     class ActiveRecordStore
-      attr_reader :model_ref
+      UNIQUE_BY = %i[principal http_method path key].freeze
+      PURGE_EVERY = 3600
+
+      attr_reader :model_ref, :unique_by, :purge_every
 
       # By name or by class: with Rails autoloading, the model does not exist yet at configuration time.
-      def initialize(model) = @model_ref = model
+      def initialize(model, unique_by: UNIQUE_BY, purge_every: PURGE_EVERY)
+        @model_ref, @unique_by, @purge_every = model, unique_by, purge_every
+        @purge_lock = Mutex.new
+        @purged_at = nil
+      end
 
       def model = @model_ref.is_a?(String) ? Object.const_get(@model_ref) : @model_ref
 
+      # Deletes every expired key, of any principal and target, and returns how many. A key whose
+      # request is still running is never expired: its lifetime starts when it is first used and
+      # is at least a day (7.1).
+      def purge(now = Time.now.utc)
+        @purge_lock.synchronize { @purged_at = now }
+        model.where("expires_at < ?", now).delete_all
+      end
+
+      # Purges when purge_every seconds have passed since the last purge of this process.
+      def purge_if_due(now = Time.now.utc)
+        return if purge_every.nil?
+        due = @purge_lock.synchronize do
+          next false if @purged_at && now - @purged_at < purge_every
+          @purged_at = now
+        end
+        model.where("expires_at < ?", now).delete_all if due
+      end
+
       def run(scope, request_hash, ttl:, precheck:, replay:)
+        purge_if_due
         3.times do
           model.where(scope).where("expires_at < ?", Time.now.utc).delete_all
-          model.insert_all([scope.merge(request_hash: request_hash, expires_at: Time.now.utc + ttl)],
-                           unique_by: :index_idempotency_keys_unique)
+          model.insert_all([scope.merge(request_hash: request_hash, expires_at: Time.now.utc + ttl)], unique_by: unique_by)
           row = model.find_by(scope)
           next if row.nil? # a rejected request deleted it in between: try again
 

@@ -2,26 +2,31 @@ module Restep
   # If-Match / If-None-Match (RFC 9110 §13.1.1 and §13.1.2).
   module Conditional
     # entity-tag = [ "W/" ] DQUOTE *etagc DQUOTE; etagc = %x21 / %x23-7E / obs-text
-    TAG = %r{\G[ \t]*(W/)?"([\x21\x23-\x7e\x80-\xff]*)"[ \t]*(?:,|\z)}n
+    TAG = %r{\G(W/)?"([\x21\x23-\x7e\x80-\xff]*)"}n
+    SEPARATORS = /\G[ \t,]*/n
 
     module_function
 
     # Returns :any, a list of [weak, opaque] or raises 400 if the header is malformed.
+    # The field is "*" / #entity-tag (RFC 9110, sections 13.1.1 and 5.6.1): a list may be empty
+    # and may have empty elements, so an empty If-Match is a list with no entity tag, which no
+    # ETag matches (412), and an empty If-None-Match matches none (the request goes on).
     def parse(name, value)
       return nil if value.nil?
       v = value.b.strip
       return :any if v == "*"
       tags = []
-      pos = 0
-      v = v.gsub(/,[ \t]*(?=,)/, ",") # empty list elements
-      until pos >= v.length
+      pos = SEPARATORS.match(v, 0).end(0)
+      while pos < v.length
         m = TAG.match(v, pos)
-        unless m && m.begin(0) == pos
+        sep = m && SEPARATORS.match(v, m.end(0))
+        # After a tag: optional whitespace, then a comma or the end.
+        unless m && m.begin(0) == pos && (sep.end(0) == v.length || v.byteslice(m.end(0), sep.end(0) - m.end(0)).include?(","))
           raise Problem.new(400, "bad_request", detail: "The #{name} header is malformed: expected * or a list of entity tags.",
                                                 errors: [{ "header" => name, "code" => "format", "detail" => "Not a valid list of entity tags." }])
         end
         tags << [!m[1].nil?, m[2]]
-        pos = m.end(0)
+        pos = sep.end(0)
       end
       tags
     end

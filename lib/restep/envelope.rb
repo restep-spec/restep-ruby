@@ -14,6 +14,14 @@ module Restep
   #   that a browser sent from an origin the API does not allow: the API's own origin and the
   #   origins of cors are allowed; "*" allows none. Allowed origins also get
   #   Access-Control-Allow-Credentials: true.
+  # - exempt: with credentials: true, ->(env) { true or false } says which requests the
+  #   application authenticates only with a token a browser never attaches on its own (a bearer
+  #   token in Authorization, an API key header). §5.8 does not cover them, so they skip the
+  #   origin check. The application must not also authenticate them with a cookie:
+  #     use Restep::Envelope, credentials: true, exempt: Restep::Envelope.method(:token_authorization?)
+  # - path: the API's root path ("/v1"), or a list of them. Only requests under it go through the
+  #   envelope; the rest (the HTML pages of the same application) go straight to the application,
+  #   untouched. Without it, every request is the API's.
   class Envelope
     KNOWN = %w[GET HEAD POST PUT PATCH DELETE OPTIONS TRACE CONNECT].freeze
     SAFE = %w[GET HEAD OPTIONS TRACE].freeze
@@ -24,8 +32,12 @@ module Restep
     ALLOW_HEADERS = "Content-Type, Content-Disposition, If-Match, If-None-Match, Idempotency-Key, Prefer, Authorization, DPoP"
     ALLOW_METHODS = "GET, HEAD, POST, PATCH, DELETE, QUERY"
 
-    def initialize(app, cors: "*", credentials: false)
+    def initialize(app, cors: "*", credentials: false, exempt: nil, path: nil)
       @app = app
+      raise ArgumentError, "exempt takes a callable, ->(env) { true or false }" unless exempt.nil? || exempt.respond_to?(:call)
+      raise ArgumentError, "exempt goes with credentials: true" if exempt && !credentials
+      @exempt = exempt
+      @paths = path.nil? ? nil : Array(path).map { |p| normalize_path(p) }
       @cors =
         case cors
         when "*", false, nil then cors || false
@@ -35,7 +47,23 @@ module Restep
       @credentials = credentials
     end
 
+    # Whether Authorization carries a token a browser never attaches on its own: any scheme but
+    # Basic, Digest, Negotiate and NTLM, which a browser repeats by itself once the user has given
+    # them (§5.8 counts them as HTTP authentication).
+    def self.token_authorization?(env)
+      scheme = env["HTTP_AUTHORIZATION"].to_s.strip.split(/[ \t]/, 2).first.to_s.downcase
+      !scheme.empty? && !%w[basic digest negotiate ntlm].include?(scheme)
+    end
+
+    # Whether the request is under one of the envelope's paths (all are, without path:).
+    def covers?(env)
+      return true if @paths.nil?
+      full = "#{env["SCRIPT_NAME"]}#{env["PATH_INFO"]}"
+      @paths.any? { |p| p == "" || full == p || full.start_with?("#{p}/") }
+    end
+
     def call(env)
+      return @app.call(env) unless covers?(env)
       method = env["REQUEST_METHOD"].to_s
       # Rails parses the query and the body as soon as anyone asks for `params`, and its own
       # instrumentation (the "Parameters: ..." log line) asks for it before entering the action:
@@ -50,7 +78,7 @@ module Restep
           preflight(origin)
         elsif !KNOWN.include?(method)
           Problem.rack(501, "not_implemented", detail: "This server does not implement the #{method} method.")
-        elsif @credentials && !SAFE.include?(method) && cross_origin?(env, origin)
+        elsif @credentials && !SAFE.include?(method) && cross_origin?(env, origin) && !@exempt&.call(env)
           Problem.rack(403, "forbidden", detail: "This API does not accept writes sent by a browser from #{origin || "another site"} (5.8).")
         else
           @app.call(env)
@@ -109,6 +137,11 @@ module Restep
 
     # The API's origin as Rack sees it (behind a proxy, from the forwarded headers Rack trusts).
     def own_origin(env) = normalize_origin(Rack::Request.new(env).base_url)
+
+    def normalize_path(p)
+      raise ArgumentError, "path: #{p.inspect} must be an absolute path such as \"/v1\"" unless p.is_a?(String) && p.start_with?("/")
+      p.delete_suffix("/")
+    end
 
     # scheme://host[:port] in lowercase, without the default port.
     def normalize_origin(o)

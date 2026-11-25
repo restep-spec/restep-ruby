@@ -116,7 +116,7 @@ end
 
 require_relative "restep/version"
 
-%w[problem query_string types language template parents source collection envelope conditional cursor
+%w[problem query_string types merge_patch language template parents source collection envelope conditional cursor
    query body idempotency discovery rules check request resolver context relations operations
    sources/computed rack_app].each do |f|
   require_relative "restep/#{f}"

@@ -11,17 +11,32 @@ module Restep
   # With a hand-written discovery document (Restep.config.discovery), what discovery declares
   # (path, parent, description, filter, sort, max_limit...) may be left out here: the document
   # fills it in, and Restep.check! fails on anything the code contradicts.
+  # What an action's run returns to answer other than with its default (§11.1, draft 7):
+  #   Restep::Created.new(location)        # 201 with the Location of what it created (absolute path)
+  #   Restep::Created.new(location, body)  # the same with a JSON object as its body
+  #   Restep::NO_CONTENT                   # 204, on an item or a singleton
+  Created = Struct.new(:location, :body)
+  NoContent = Class.new
+  NO_CONTENT = NoContent.new.freeze
+
   class Collection
     Field = Struct.new(:name, :type, :column, :values, :nullable, :required, :default, :read_only,
                        :max_length, :pattern, :range, :scale, :relation, :description, :include,
-                       :languages, keyword_init: true)
+                       :languages, :schema, :validate, keyword_init: true)
 
     # An action (§11.1). on: "item" or "collection"; method: "POST" or "GET" (only safe ones);
     # input: body fields (Fields.f), or nil. available: whether the item's state allows it
     # (what _actions lists); unavailable: the 409 it gives if not. run: the effect, which gets
     # the item (or, in a collection action, the source's scope for the parents: an Active Record
-    # relation for Restep::Sources::ActiveRecord) and the validated input. In an item action, the
-    # response is the re-read item; in a collection one, run returns [status, JSON object or nil].
+    # relation for Restep::Sources::ActiveRecord) and the validated input. §11.1 (draft 7) fixes
+    # what each kind answers:
+    # - unsafe, on an item: the re-read item (200), unless run returns Restep::Created (201 with
+    #   Location) or Restep::NO_CONTENT (204);
+    # - unsafe, on a collection: run returns Restep::Created (201 with Location) or [204, nil];
+    #   never 200, since a collection has no representation of its own;
+    # - safe, with GET or POST: run returns [status, result or nil]; a result (200) needs a
+    #   declared output on a collection, and nil answers 204. A safe POST action takes an input,
+    #   so it is how a client asks for a computed result from data in a body (a diff, a quote).
     # effects: what a person may want to approve first (§11.1, draft 7), a list out of destroys,
     # external and charges, or nil to leave it undeclared. output: the JSON Schema of a safe
     # action's result, which is not a representation; a safe action without output answers its
@@ -149,8 +164,21 @@ module Restep
           end
         end
         raise ArgumentError, "#{name}: #{f.name}: include is for relation fields (9)" if !f.include.nil? && f.type != "relation"
+        raise ArgumentError, "#{name}: #{f.name}: schema is for object and array fields (4.3)" if f.schema && !JSON_TYPES.include?(f.type)
+        raise ArgumentError, "#{name}: #{f.name}: validate takes ->(value, pointer) { [errors] or nil }" if f.validate && !f.validate.respond_to?(:call)
+      end
+      # §4.2 and §6.1: an object or array has no type of the discovery list, so it is filtered and
+      # sorted by a dotted path to a scalar inside it (address.city), never whole.
+      (filters.keys + sort.keys).each do |k|
+        if JSON_TYPES.include?(fields[k]&.type)
+          raise ArgumentError, "#{name}: #{k} is of type #{fields[k].type}: filter or sort by a member, such as #{k}.name, with its own sql: or value: (6.1)"
+        end
       end
     end
+
+    # Fields whose value is any JSON object or array (a document the item carries): their shape
+    # goes in the schemas (§4.3), never in the types of discovery (§4.2).
+    JSON_TYPES = %w[object array].freeze
 
     # ---- Paths ----------------------------------------------------------------------------------
 
@@ -372,6 +400,10 @@ module Restep
           # §3: merged by key, validated first (deleted keys too); left as it was, it changes nothing.
           merged = Language.merge(f, current[k] || {}, v, ptr, errors)
           changes[f.column] = merged unless merged == :error || merged == (current[k] || {})
+        elsif f.type == "object" && v.is_a?(Hash)
+          # §5.1: a merge patch (RFC 7396) merges an object member by member.
+          val = coerce(f, MergePatch.apply(current[k], v), ptr, errors)
+          changes[f.column] = val unless val == :error || Types.canonical_json(val) == Types.canonical_json(current[k])
         elsif f.type == "relation" && current_relation?(f, v, current[k])
           # Relation with its current value: ignored without checking that the target exists
           # (§5.1); only href, if present, is checked to be that item's path.
@@ -385,7 +417,8 @@ module Restep
         else
           val = coerce(f, v, ptr, errors)
           next if val == :error
-          changes[f.column] = val unless same_value?(source.value(rec, f.column), val)
+          same = JSON_TYPES.include?(f.type) ? Types.canonical_json(val) == Types.canonical_json(current[k]) : same_value?(source.value(rec, f.column), val)
+          changes[f.column] = val unless same
         end
       end
       raise Problem.invalid(errors) unless errors.empty?
@@ -446,7 +479,18 @@ module Restep
       a && a == Types.parse_datetime(current)
     end
 
+    # The value of a field in a request body, checked against its type and then against the
+    # field's own validate: hook, or :error with the 422 entries added to errors.
     def coerce(f, v, ptr, errors)
+      val = coerce_type(f, v, ptr, errors)
+      return val if val == :error || f.validate.nil?
+      found = Array(f.validate.call(val, ptr))
+      return val if found.empty?
+      errors.concat(found)
+      :error
+    end
+
+    def coerce_type(f, v, ptr, errors)
       fail_with = ->(code, detail) { errors << err(ptr, code, detail); :error }
       case f.type
       when "string", "enum"
@@ -491,6 +535,12 @@ module Restep
         return fail_with.("format", "#{f.name} must be an RFC 3339 date-time with an offset.") unless r
         return fail_with.("format", "#{f.name} takes at most microsecond precision.") unless Types.micro_exact?(r)
         Time.at(r).utc
+      when "object"
+        return fail_with.("type", "#{f.name} must be a JSON object.") unless v.is_a?(Hash)
+        Types.json_value(v, ptr, errors)
+      when "array"
+        return fail_with.("type", "#{f.name} must be a JSON array.") unless v.is_a?(Array)
+        Types.json_value(v, ptr, errors)
       when "relation"
         return fail_with.("type", "#{f.name} must be an object with an id, such as {\"id\": \"3\"}.") unless v.is_a?(Hash)
         unless v.key?("id")
